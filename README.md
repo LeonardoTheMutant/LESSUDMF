@@ -2,11 +2,11 @@
 A tool to optimize UDMF map data in WAD files
 
 ## Capabilities
-- Cleanup the TEXTMAP lump from comments, whitespaces and newlines
+- Cleanup the TEXTMAP lump inside WAD from comments, whitespaces and newlines
 - Merge identical sectors in maps so the sector duplicates are removed
 
 ## How to use
-Simply run `LESSUMDF [Inputfile.WAD]` from terminal and your get your WAD back with optimized UDMF maps. Just replace the `[Inputfile.WAD]` with a real file path to the WAD file. The WAD file size becomes smaller by 30% on average. **Always make sure you have a copy of your Input WAD and check the contents of the Output WAD!**
+Run `LESSUMDF [Inputfile.WAD]` from terminal and you get your WAD back with optimized UDMF maps. Just replace the `[Inputfile.WAD]` with a real file path to the WAD file. The WAD file size becomes smaller by 30% on average. **Always make sure you have a copy of your Input WAD and check the contents of the Output WAD!**
 
 ## Command line parameters
 - `-o [Outputfile.WAD]` - Output to the file. If not given, an `./OUTPUT.WAD` file will be created instead.
