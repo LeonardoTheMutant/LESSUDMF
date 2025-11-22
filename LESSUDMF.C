@@ -1,12 +1,13 @@
-//"Less UDMF" version 2.1
-//A tool to optimize the UDMF data in WAD
+//"Less UDMF" version 3
+//A tool to optimize the UDMF maps data in WAD
 //Code by LeonardoTheMutant
 
-//Changes in version 2.1:
-// - Fields which are set to default values are not written to the output WAD
+//Changes in version 3:
+// - Sector merging algorithm was updated to detect sloped sectors in SRB2 format (made either by sector properties,
+//   linedef specials or vertices) so they don't get merged with each other
 
-//To do for version 3:
-// - Prevent merging sloped sectors which are made by verticies or linedef specials
+// TODO in future updates:
+// - Add support for different game engines (DOOM, Heretic, Hexen, Strife, ZDoom, etc.)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,11 +24,16 @@
 	#define PATHCMP strcmp
 #endif
 
-//WAD file
-typedef struct {
-	int lumpsAmount;
-	int directory_adress;
-} wadfile_t;
+//Game engines
+enum {
+	ENGINE_UNKNOWN, //unknown engine, some program features will be disabled
+	ENGINE_DOOM, //currently unsupported
+	ENGINE_HERETIC, //currently unsupported
+	ENGINE_HEXEN,  //currently unsupported
+	ENGINE_STRIFE, //currently unsupported
+	ENGINE_ZDOOM,  //currently unsupported
+	ENGINE_SRB2, //Sonic Robo Blast 2
+};
 
 //Lump
 typedef struct {
@@ -40,24 +46,26 @@ typedef struct {
 typedef struct {
 	char *key;
 	char *value;
-} kvpair_t;
+} field_t;
 
 //single TEXTMAP data block
 typedef struct {
 	char header[8]; //"sector", "sidedef", "thing", etc.
-	kvpair_t *pairs; //array of Key/Value pairs
-	size_t pairsCount; //amount of pairs the block has
-	size_t pairsCapacity; //allocated capacity of the *pairs array
+	field_t *fields; //array of key/value fields
+	size_t fieldsCount; //amount of fields the block has
+	size_t fieldsCapacity; //allocated capacity of the .fields array
 } block_t;
 
 typedef struct {
 	block_t *block; //pointer to the block
 	char isMaster; // 1=kept, 0=removed as duplicate, -1=unvisited
+	char isSlope; // 1=sloped sector, 0=not sloped
 	int sectorID; //index of the sector in ORIGINAL ordering
 	int masterID; // new index of the sector
 } sector_t;
 
-kvpair_t defaultFieldValues[] = {
+// Collection of (cross-compatible) default field values taken from all known engines
+const field_t defaultFieldValues[] = {
 	{"blocking", "false"},
 	{"blockmonsters", "false"},
 	{"twosided", "false"},
@@ -163,7 +171,14 @@ kvpair_t defaultFieldValues[] = {
 	{"ambush", "false"},
 	{"single", "false"},
 	{"dm", "false"},
-	{"coop", "false"}
+	{"coop", "false"},
+	{NULL, NULL},
+};
+
+const char *sectorSlopeKeys_SRB2[] = {
+	"floorplane_a", "floorplane_b", "floorplane_c", "floorplane_d",
+	"ceilingplane_a", "ceilingplane_b", "ceilingplane_c", "ceilingplane_d",
+	NULL
 };
 
 block_t *blocks;
@@ -171,20 +186,23 @@ unsigned int blockCount = 0;
 sector_t *sectors;
 unsigned int sectorCount;
 char *namespaceStr;
+char gameEngine;
 
 static FILE *inputWAD;
 static FILE *outputWAD;
 static char outputFilePath[PATH_MAX] = "./OUTPUT.WAD";
 
-static unsigned int buffer_int = 0; // multipurpose
+static unsigned int bufferA = 0; //multipurpose
+static unsigned int bufferB = 0; //multipurpose
 static char buffer_str[0x400];
 static char *LUMP_BUFFER;
 
-static wadfile_t WADfile;
+static unsigned int WAD_LumpsAmount;
+static unsigned int WAD_DirectoryAddress;
 static lump_t *lumps; //array of lumps loaded from the Input Wad
 
 //Check if two filepaths refer to the same file
-char areSameFiles(const char *path1, const char *path2) {
+char BOOL_AreSameFiles(const char *path1, const char *path2) {
 	char abs1[PATH_MAX], abs2[PATH_MAX];
 	if (!realpath(path1, abs1) || !realpath(path2, abs2))
 		return 0; // If either path can't be resolved, assume not the same
@@ -200,6 +218,22 @@ static void closeIO(void) {
 //isspace() from ctype.h
 static char isspace(char c) {
 	return (c == 0x20 || c == 0x09 || (c >= 0x0a && c <= 0x0d));
+}
+
+// Get the value for a key in a block
+static const char *getFieldValueFromBlock(const block_t *blk, const char *key) {
+	for (unsigned short i = 0; i < blk->fieldsCount; i++) {
+		if (!strcmp(blk->fields[i].key, key)) return blk->fields[i].value;
+	}
+	return 0;
+}
+
+// Check if the block contains a field with the given key
+static char BOOL_BlockHasField(const block_t *blk, const char *strkey) {
+	for (unsigned short i = 0; i < blk->fieldsCount; i++) {
+		if (!strcmp(blk->fields[i].key, strkey)) return 1;
+	}
+	return 0;
 }
 
 //Safe realloc()
@@ -225,42 +259,34 @@ static char *xstrdup(const char *s) {
 	return d;
 }
 
-//Add a key/value pair into block
-static void add_pair(block_t *blk, const char *key, const char *value) {
-	if (blk->pairsCount >= blk->pairsCapacity) {
-		blk->pairsCapacity = blk->pairsCapacity ? blk->pairsCapacity * 2 : 4;
-		blk->pairs = (kvpair_t*)xrealloc(blk->pairs, blk->pairsCapacity * sizeof(kvpair_t));
+//Add a key/value field into block
+static void addField(block_t *blk, const char *key, const char *value) {
+	if (blk->fieldsCount >= blk->fieldsCapacity) {
+		blk->fieldsCapacity = blk->fieldsCapacity ? blk->fieldsCapacity * 2 : 4;
+		blk->fields = (field_t*)xrealloc(blk->fields, blk->fieldsCapacity * sizeof(field_t));
 	}
-	blk->pairs[blk->pairsCount].key = xstrdup(key);
-	blk->pairs[blk->pairsCount].value = xstrdup(value);
-	blk->pairsCount++;
+	blk->fields[blk->fieldsCount].key = xstrdup(key);
+	blk->fields[blk->fieldsCount].value = xstrdup(value);
+	blk->fieldsCount++;
 }
 
-static int isFieldDefaultValue(const kvpair_t *a) {
-	for (unsigned char x = 0; x < 91; x++) 
+// Is a given key/value pair equal to a known default value? Multiengine checker
+static char BOOL_IsFieldDefaultValue(const field_t *a) {
+	for (unsigned char x = 0; defaultFieldValues[x].key; x++)
 		if (!strcmp(defaultFieldValues[x].key, a->key) && !strcmp(defaultFieldValues[x].value, a->value)) return 1;
 
 	return 0;
 }
 
-//Allocate space for a new block in memory
-static void add_block(const char *header) {
-	blocks = (block_t*)realloc(blocks, (blockCount + 1) * sizeof(block_t));
-	block_t *blk = &blocks[blockCount];
-	memset(blk, 0, sizeof(block_t));
-	strncpy(blk->header, header, sizeof(blk->header)-1);
-	blockCount++;
-}
-
 //Compare two block_t structs
-static int areBlocksEqual(const block_t *a, const block_t *b) {
-	if (a->pairsCount != b->pairsCount) return 0;
-	char matched[b->pairsCount];
+static char BOOL_AreBlocksEqual(const block_t *a, const block_t *b) {
+	if (a->fieldsCount != b->fieldsCount) return 0;
+	char matched[b->fieldsCount];
 	memset(matched, 0, sizeof(matched));
-	for (unsigned short i = 0; i < a->pairsCount; ++i) {
+	for (unsigned short i = 0; i < a->fieldsCount; i++) {
 		int found = 0;
-		for (unsigned short j = 0; j < b->pairsCount; ++j) {
-			if (!matched[j] && !strcmp(a->pairs[i].key, b->pairs[j].key) && !strcmp(a->pairs[i].value, b->pairs[j].value)) {
+		for (unsigned short j = 0; j < b->fieldsCount; j++) {
+			if (!matched[j] && !strcmp(a->fields[i].key, b->fields[j].key) && !strcmp(a->fields[i].value, b->fields[j].value)) {
 				matched[j] = 1;
 				found = 1;
 				break;
@@ -271,107 +297,263 @@ static int areBlocksEqual(const block_t *a, const block_t *b) {
 	return 1;
 }
 
-// TEXTMAP cleaner, removes all comments, whitespaces and unnecessary newlines
-static char* cleanupTEXTMAP(char *textmapdata, int size, int *newSize) {
-	//size_t mallocSize = size * 2 + 1;
-	char *out = (char*)malloc(size);
-	memset(out, 0, size);
-	char *line = strtok(textmapdata, "\n");
-	buffer_int &= ~1; //set the lowest bit to 0, 0x1 - currently in string
-	unsigned int newsize = 0;
-	while (line)
-	{
-		//remove comments
-		char *comment = strstr(line, "//");
-		if (comment) *comment = '\0'; // Truncate the line before the comment
-		// Trim leading and trailing whitespace
-		char *start = line;
-		while (isspace(*start)) *start++;
-		char *end = line + strlen(line) - 1;
-		while (end > start && isspace(*end)) end--;
-		*(end + 1) = '\0';
-		//remove spaces where they are not required
-		char *writePtr = start;
-		for (char *readPtr = start; *readPtr; readPtr++) {
-			if (*readPtr == '\"') buffer_int ^= 1; //entered/left the string
-			if (!isspace((unsigned char)*readPtr) || (buffer_int & 1)) { //remove the space ONLY when its outside the string
-				*writePtr++ = *readPtr;
-			}
-		}
-		*writePtr = '\0';
-		// Check if the line is empty
-		if (!strlen(start)) { line = strtok(NULL, "\n"); continue; }
-		newsize += strlen(start);
-		strcat(out, start);
-		line = strtok(NULL, "\n");
-	}
-	strcat(out, "\n");
-	*newSize = newsize + 1;
-	return out;
-}
+// Collect linedef blocks that reference any sidedef belonging to the given sector.
+// Returns a dynamically allocated array of block_t* and sets outCount. Caller must free the
+// returned array (but not the block_t pointers themselves).
+static block_t **SECTOR_GetLinedefs(unsigned int sectorIndex, unsigned int *outCount) {
+	*outCount = 0;
+	if (sectorIndex >= sectorCount) return NULL;
 
-//Tokenize TEXTMAP into block structures (block_t)
-static void parseTEXTMAP(char *textmapdata) {
-	char *ptr = textmapdata;
-	while (*ptr) {
-		if (strncmp(ptr, "namespace", 9) == 0) {
-			//Save namespace metadata
-			ptr += 9;
-			if (*ptr == '=') ptr++;
-			if (*ptr == '"') ptr++;
-			char *start = ptr;
-			while (*ptr && *ptr != '"') ptr++;
-			size_t len = ptr - start;
-			namespaceStr = (char*)malloc(len + 1);
-			memcpy(namespaceStr, start, len);
-			namespaceStr[len] = '\0';
-			while (*ptr && *ptr != ';') ptr++;
-			if (*ptr == ';') ptr++;
-		} else {
-			// Read block header
-			char *hptr = buffer_str; //header
-			while (*ptr && *ptr != '{') { *hptr++ = *ptr++; }
-			*hptr = 0;
-			add_block(buffer_str);
-			block_t *blk = &blocks[blockCount-1];
+	// First pass: find which sidedef indices point to this sector
+	bufferA = 0; //side index
+	bufferB = 0; //matching count
+	unsigned int *matchingSides = NULL;
+	snprintf(buffer_str, sizeof(buffer_str), "%u", sectorIndex);
 
-			if (*ptr == '{') ptr++;
-
-			// Parse inside block
-			while (*ptr && *ptr != '}') {
-				char key[128], value[128];
-				char *kptr = key;
-				while (*ptr && *ptr != '=' && *ptr != '}') { *kptr++ = *ptr++; }
-				*kptr = 0;
-				if (*ptr == '=') ptr++;
-				char *vptr = value;
-				if (*ptr == '"') {
-					*vptr++ = '"'; // keep opening quote
-					ptr++;
-					while (*ptr && *ptr != '"') *vptr++ = *ptr++;
-					if (*ptr == '"') {
-						*vptr++ = '"'; // keep closing quote
-						ptr++;
-					}
-				} else {
-					while (*ptr && *ptr != ';' && *ptr != '}') *vptr++ = *ptr++;
+	for (unsigned int i = 0; i < blockCount; i++) {
+		if (!strncmp(blocks[i].header, "sidedef", 7)) {
+			const char *sec = getFieldValueFromBlock(&blocks[i], "sector");
+			if (sec) {
+				unsigned int sval = strtol(sec, NULL, 10);
+				if (sval >= 0 && sval == sectorIndex) {
+					matchingSides = (unsigned int*)xrealloc(matchingSides, (bufferB + 1) * sizeof(unsigned int));
+					matchingSides[bufferB++] = bufferA;
 				}
-				*vptr = 0;
-				add_pair(blk, key, value);
-				if (*ptr == ';') ptr++;
 			}
-			if (*ptr == '}') ptr++;
+			bufferA++;
 		}
 	}
 
-	// Remove trailing empty blocks
-	while (blockCount > 0 && blocks[blockCount - 1].pairsCount == 0) {
-		free(blocks[blockCount - 1].pairs);
-		blockCount--;
+	if (!bufferB) { //found no sidedefs referencing this sector
+		free(matchingSides);
+		return NULL;
 	}
+
+	// Second pass: find linedefs that reference any of these sidedef indices
+	block_t **found = NULL;
+	bufferA = 0; //found linedefs count
+	for (unsigned int i = 0; i < blockCount; i++) {
+		if (!strncmp(blocks[i].header, "linedef", 7)) {
+			// examine each pair in the linedef; if any numeric value equals a matching sidedef index, record it
+			for (unsigned short p = 0; p < blocks[i].fieldsCount; p++) {
+				// check for sidedef references
+				if (!strncmp(blocks[i].fields[p].key, "sidefront", 9) || !strncmp(blocks[i].fields[p].key, "sideback", 8)) {
+					unsigned int iv = strtol(blocks[i].fields[p].value, NULL, 10);
+					if (iv >= 0) {
+						// compare against matchingSides
+						for (unsigned int m = 0; m < bufferB; m++) {
+							if (iv == matchingSides[m]) {
+								found = (block_t**)xrealloc(found, (bufferA + 1) * sizeof(block_t*));
+								found[bufferA++] = &blocks[i];
+								goto next_linedef; // avoid adding same linedef multiple times
+							}
+						}
+					}
+				}
+			}
+		}
+		next_linedef: ;
+	}
+
+	free(matchingSides);
+	*outCount = bufferA;
+	return found;
 }
 
-static void deduplicateSectors() {
+// Collect unique vertex blocks that form the polygon boundary of the given sector.
+// Returns a dynamically allocated array of block_t* (unique, order of discovery) and sets outCount.
+// Caller must free the returned array (but not the block_t pointers themselves).
+static block_t **SECTOR_GetPolygonVertices(unsigned int sectorIndex, unsigned int *outCount) {
+	*outCount = 0;
+	if (sectorIndex >= sectorCount) return NULL;
+
+	// First pass: collect sidedef indices belonging to this sector
+	bufferA = 0; //side Idx
+	bufferB = 0; //sidedef count
+	unsigned int *sidedefIndices = NULL;
+	for (unsigned int i = 0; i < blockCount; i++) {
+		if (!strncmp(blocks[i].header, "sidedef", 7)) {
+			const char *sec = getFieldValueFromBlock(&blocks[i], "sector");
+			if (sec) {
+				char tmp[64]; size_t sl = strlen(sec);
+				if (sl >= sizeof(tmp)) sl = sizeof(tmp)-1;
+				memcpy(tmp, sec, sl); tmp[sl] = '\0';
+				if (tmp[0] == '"' && tmp[sl-1] == '"') { memmove(tmp, tmp+1, sl-2); tmp[sl-2] = '\0'; }
+				// trim trailing and leading spaces
+				{
+					char *end = tmp + strlen(tmp) - 1;
+					while (end >= tmp && isspace((unsigned char)*end)) { *end = '\0'; end--; }
+				}
+				char *t = tmp; while (*t && isspace((unsigned char)*t)) t++;
+				char *endptr = NULL;
+				long sval = strtol(t, &endptr, 10);
+				if (endptr && *endptr == '\0' && sval >= 0 && (unsigned long)sval == (unsigned long)sectorIndex) {
+					sidedefIndices = (unsigned int*)xrealloc(sidedefIndices, (bufferB + 1) * sizeof(unsigned int));
+					sidedefIndices[bufferB++] = bufferA;
+				}
+			}
+			bufferA++;
+		}
+	}
+	if (!bufferB) { //found no sidedefs
+		free(sidedefIndices);
+		return NULL;
+	}
+
+	// Build vertex list (ordered by occurrence) to index into
+	bufferA = 0; //total vertices
+	for (unsigned int i = 0; i < blockCount; i++) if (!strncmp(blocks[i].header, "vertex", 6)) bufferA++;
+	if (!bufferA) { //
+		free(sidedefIndices);
+		return NULL;
+	}
+
+	block_t **vertexList = (block_t**)malloc(bufferA * sizeof(block_t*));
+	unsigned int vi = 0;
+	for (unsigned int i = 0; i < blockCount; i++) if (!strncmp(blocks[i].header, "vertex", 6)) vertexList[vi++] = &blocks[i];
+
+	// Second pass: for every linedef, if it references any of the sidedefIndices, collect its v1/v2
+	block_t **found = NULL;
+	unsigned int foundCount = 0;
+	for (unsigned int i = 0; i < blockCount; i++) {
+		if (!strncmp(blocks[i].header, "linedef", 7)) {
+			// check fields for sidefront/sideback
+			char referencesSector = 0;
+			for (unsigned short p = 0; p < blocks[i].fieldsCount; ++p) {
+				if (!strncmp(blocks[i].fields[p].key, "sidefront", 9) || !strncmp(blocks[i].fields[p].key, "sideback", 8)) {
+					unsigned int iv = strtol(blocks[i].fields[p].value, NULL, 10);
+					if (iv >= 0) {
+						for (unsigned int m = 0; m < bufferB; m++) {
+							if (iv == sidedefIndices[m]) { referencesSector = 1; break; }
+						}
+					}
+					if (referencesSector) break;
+				}
+			}
+			if (!referencesSector) continue;
+
+			// get v1 and v2 fields
+			const char *verts[2] = { getFieldValueFromBlock(&blocks[i], "v1"), getFieldValueFromBlock(&blocks[i], "v2") };
+			for (int viidx = 0; viidx < 2; viidx++) {
+				const char *vs = verts[viidx];
+				if (!vs || !*vs) continue;
+				unsigned int idx = strtol(vs, NULL, 10);
+				if (idx >= 0 && idx < bufferA) {
+					// avoid duplicates
+					char already = 0;
+					for (unsigned int f = 0; f < foundCount; f++) if (found[f] == vertexList[idx]) { already = 1; break; }
+					if (!already) {
+						found = (block_t**)xrealloc(found, (foundCount + 1) * sizeof(block_t*));
+						found[foundCount++] = vertexList[idx];
+					}
+				}
+			}
+		}
+	}
+
+	free(sidedefIndices);
+	free(vertexList);
+	*outCount = foundCount;
+	return found;
+}
+
+// Determine whether a sector is likely a sloped sector by checking for slope-related fields
+// in the sector itself, related linedefs and vertices.
+// Argument is an index to the sectors[] array
+static char BOOL_IsSectorSloped(unsigned int sectorIndex) {
+	if (sectorIndex >= sectorCount) return 0;
+	block_t *sectorBlk = sectors[sectorIndex].block;
+
+	// Check if sector has fields directly indicating that it is a slope
+	const char **sectorKeys = NULL;
+	switch(gameEngine) {
+		case ENGINE_SRB2:
+			sectorKeys = sectorSlopeKeys_SRB2;
+			break;
+		default:
+			sectorKeys = NULL;
+			break;
+	}
+	if (sectorKeys) {
+		for (int k = 0; sectorKeys[k]; k++) {
+			if (BOOL_BlockHasField(sectorBlk, sectorKeys[k])) return 1;
+		}
+	}
+
+	// Collect linedefs associated with this sector (via sidedefs)
+	bufferA = 0; //linedef count
+	block_t **linedefs = SECTOR_GetLinedefs(sectorIndex, &bufferA);
+	if (!linedefs) {
+		return 0; // no linedefs referencing sidedefs of this sector
+	}
+
+	// Inspect collected linedefs for slope-creating properties (conservative)
+	for (unsigned int i = 0; i < bufferA; i++) {
+		block_t *ld = linedefs[i];
+		const char *specs = getFieldValueFromBlock(ld, "special");
+		bufferB = strtol(specs ? specs : "0", NULL, 10); //Linedef special number
+		switch (gameEngine)
+		{
+			case ENGINE_SRB2: //Sonic Robo Blast 2
+				switch(bufferB) {
+					case 700:
+					case 704:
+					case 720:
+					case 799:
+						free(linedefs);
+						return 1;
+				}
+				break;
+		}
+	}
+
+	if (gameEngine == ENGINE_SRB2) {
+		// Polygon-only vertex check: collect unique polygon vertices for the sector and inspect them.
+		// Stricter rule: require at least two distinct numeric vertex heights to mark the sector sloped.
+		bufferA = 0; //polyVertexCount
+		block_t **polyVertices = SECTOR_GetPolygonVertices(sectorIndex, &bufferA);
+		if (polyVertices) {
+
+			double *zvals = NULL;
+			unsigned int zcount = 0;
+
+			for (unsigned int pv = 0; pv < bufferA; pv++) {
+
+				const char *zstr = NULL;
+				if (BOOL_BlockHasField(polyVertices[pv], "zfloor")) zstr = getFieldValueFromBlock(polyVertices[pv], "zfloor");
+				else if (BOOL_BlockHasField(polyVertices[pv], "zceiling")) zstr = getFieldValueFromBlock(polyVertices[pv], "zceiling");
+
+				if (zstr && *zstr) {
+					double zv = strtod(zstr, NULL);
+					char found = 0;
+
+					for (unsigned int zi = 0; zi < zcount; zi++)
+						if (zvals && zvals[zi] == zv) { found = 1; break; }
+
+					if (!found) {
+						zvals = (double*)xrealloc(zvals, (zcount + 1) * sizeof(double));
+						zvals[zcount++] = zv;
+					}
+				}
+			}
+
+			if (zcount > 0) {
+				free(zvals);
+				free(polyVertices);
+				free(linedefs);
+				return 1;
+			}
+
+			free(zvals);
+			free(polyVertices);
+		}
+	}
+
+	free(linedefs);
+	return 0;
+}
+
+static void MAP_DeduplicateSectors() {
 	sectorCount = 0;
 	//Count the amount of sectors in map
 	for (unsigned int i = 0; i < blockCount; i++) {
@@ -379,12 +561,17 @@ static void deduplicateSectors() {
 	}
 	sectors = (sector_t*)calloc(sectorCount, sizeof(sector_t)); //Allocate the space for sectors
 	//Load sectors
-	buffer_int = 0; //Sector counter
+	bufferA = 0; //Sector counter
 	for (unsigned int i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "sector", 6)) sectors[buffer_int++].block = &blocks[i];
+		if (!strncmp(blocks[i].header, "sector", 6)) sectors[bufferA++].block = &blocks[i];
 	}
 	// Mark all sectors as unvisited by the program
 	for (unsigned int i = 0; i < sectorCount; i++) sectors[i].isMaster = -1;
+
+	// Precompute slope flags for all sectors so we don't merge sloped sectors
+	for (unsigned int si = 0; si < sectorCount; si++) sectors[si].isSlope = 0;
+	for (unsigned int si = 0; si < sectorCount; si++) sectors[si].isSlope = BOOL_IsSectorSloped(si);
+
 	//Find identical sectors and mark them
 	unsigned int uniqueSectorID = 0;
 	for (unsigned int i = 0; i < sectorCount; i++) {
@@ -396,7 +583,12 @@ static void deduplicateSectors() {
 
 		//Compare with other sectors
 		for (unsigned int j = i + 1; j < sectorCount; j++) {
-			if ((sectors[j].isMaster == -1) && areBlocksEqual(sectors[i].block, sectors[j].block)) {
+			// Skip if already processed or either sector is a slope (do not merge slopes)
+			if (sectors[j].isMaster != -1 || sectors[j].isSlope || sectors[i].isSlope) {
+				continue;
+			}
+
+			if (BOOL_AreBlocksEqual(sectors[i].block, sectors[j].block)) {
 				//Found a duplicate
 				sectors[j].masterID = uniqueSectorID;
 				sectors[j].sectorID = j;
@@ -415,33 +607,33 @@ static void deduplicateSectors() {
 	}
 	//Load Sidedefs
 	sidedefs = (block_t*)malloc(sizeof(block_t) * sidedefCount); //Allocate space for sidedefs
-	buffer_int = 0; //Sidedef counter
+	bufferA = 0; //Sidedef counter
 	for (unsigned int i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "sidedef", 7)) sidedefs[buffer_int++] = blocks[i];
+		if (!strncmp(blocks[i].header, "sidedef", 7)) sidedefs[bufferA++] = blocks[i];
 	}
 
 	// Build masterID -> new compacted index
 	int *masterID_to_newIndex = (int*)malloc(uniqueSectorID * sizeof(int));
-	int newIndex = 0;
-	for (unsigned int i = 0; i < sectorCount; ++i) {
-		if (sectors[i].isMaster == 1) masterID_to_newIndex[sectors[i].masterID] = newIndex++;
+	bufferA = 0; //new index counter
+	for (unsigned int i = 0; i < sectorCount; i++) {
+		if (sectors[i].isMaster == 1) masterID_to_newIndex[sectors[i].masterID] = bufferA++;
 	}
 	int *oldToNew = (int*)malloc(sectorCount * sizeof(int));
-	for (unsigned int i = 0; i < sectorCount; ++i) oldToNew[i] = masterID_to_newIndex[sectors[i].masterID];
+	for (unsigned int i = 0; i < sectorCount; i++) oldToNew[i] = masterID_to_newIndex[sectors[i].masterID];
 	free(masterID_to_newIndex);
 	
 	// Remap sidedef sector indices
 	for (unsigned int i = 0; i < sidedefCount; i++) {
-		for (unsigned short j = 0; j < sidedefs[i].pairsCount; j++) {
-			if (!strcmp(sidedefs[i].pairs[j].key, "sector")) {
-				char *endptr;
-				long sectorIndex = strtol(sidedefs[i].pairs[j].value, &endptr, 10); //convert index from string to number
-				if ((*endptr == '\0') && (sectorIndex >= 0) && (sectorIndex < (long)sectorCount)) {
+		for (unsigned short j = 0; j < sidedefs[i].fieldsCount; j++) {
+			if (!strncmp(sidedefs[i].fields[j].key, "sector", 6)) {
+				unsigned int sectorIndex = strtol(sidedefs[i].fields[j].value, NULL, 10);
+				
+				if (sectorIndex < sectorCount) {
 					snprintf(buffer_str, sizeof(buffer_str), "%d", oldToNew[sectorIndex]);
-					strcpy(sidedefs[i].pairs[j].value, buffer_str);
+					strcpy(sidedefs[i].fields[j].value, buffer_str);
 				} else {
-					fprintf(stderr, "WARNING: Invalid or out-of-bounds sector index '%s' for sidedef, setting to 0\n", sidedefs[i].pairs[j].value);
-					strcpy(sidedefs[i].pairs[j].value, "0");
+					fprintf(stderr, "WARNING: Invalid or out-of-bounds sector index '%s' for sidedef, setting to 0\n", sidedefs[i].fields[j].value);
+					strcpy(sidedefs[i].fields[j].value, "0");
 				}
 			}
 		}
@@ -450,27 +642,27 @@ static void deduplicateSectors() {
 
 	//Remove sector duplicates
 	unsigned int writeIndex = 0;
-	buffer_int = 0; //track which sector we're looking at in sector[]
+	bufferA = 0; //track which sector we're looking at in sector[]
 
 	for (unsigned int i = 0; i < blockCount; i++) {
-		if (strcmp(blocks[i].header, "sector")) {
+		if (strncmp(blocks[i].header, "sector", 6)) {
 			//Not a sector block, just keep the block
 			if (writeIndex != i) blocks[writeIndex] = blocks[i];
 			writeIndex++;
 		} else {
-			if (sectors[buffer_int].isMaster) {
+			if (sectors[bufferA].isMaster) {
 				//Master sector, keep the block
 				if (writeIndex != i) blocks[writeIndex] = blocks[i];
 				writeIndex++;
 			} else {
-				//Duplicate sector, free its pairs and the block itself
-				for (unsigned short j = 0; j < blocks[i].pairsCount; j++) {
-					free(blocks[i].pairs[j].key);
-					free(blocks[i].pairs[j].value);
+				//Duplicate sector, free its fields and the block itself
+				for (unsigned short j = 0; j < blocks[i].fieldsCount; j++) {
+					free(blocks[i].fields[j].key);
+					free(blocks[i].fields[j].value);
 				}
-				free(blocks[i].pairs);
+				free(blocks[i].fields);
 			}
-			buffer_int++;
+			bufferA++;
 		}
 	}
 
@@ -482,8 +674,136 @@ static void deduplicateSectors() {
 	free(sidedefs);
 }
 
+//Tokenize TEXTMAP into block structures (block_t)
+static void TEXTMAP_Parse(char *textmapdata) {
+	char *ptr = textmapdata;
+	while (*ptr) {
+		// skip whitespace and comments at top-level
+		if (*ptr == '/' && ptr[1] == '/') {
+			ptr += 2; while (*ptr && *ptr != '\n') ptr++; if (*ptr) ptr++; continue;
+		}
+		if (*ptr == '/' && ptr[1] == '*') {
+			ptr += 2; while (*ptr && !(ptr[0] == '*' && ptr[1] == '/')) ptr++; if (*ptr) ptr += 2; continue;
+		}
+		if (isspace((unsigned char)*ptr)) { ptr++; continue; }
+
+		// namespace
+		if (!strncmp(ptr, "namespace", 9)) {
+			ptr += 9;
+			while (isspace((unsigned char)*ptr)) ptr++;
+			if (*ptr == '=') ptr++;
+			while (isspace((unsigned char)*ptr)) ptr++;
+			if (*ptr == '"') {
+				ptr++;
+				char *start = ptr;
+				while (*ptr && *ptr != '"') ptr++;
+				size_t len = ptr - start;
+				namespaceStr = (char*)malloc(len + 1);
+				memcpy(namespaceStr, start, len);
+				namespaceStr[len] = '\0';
+				if (*ptr == '"') ptr++;
+			}
+			// determine engine
+			if (namespaceStr) {
+				if (!strncmp(namespaceStr, "doom", 4)) gameEngine = ENGINE_DOOM;
+				else if (!strncmp(namespaceStr, "heretic", 7)) gameEngine = ENGINE_HERETIC;
+				else if (!strncmp(namespaceStr, "hexen", 5)) gameEngine = ENGINE_HEXEN;
+				else if (!strncmp(namespaceStr, "strife", 6)) gameEngine = ENGINE_STRIFE;
+				else if (!strncmp(namespaceStr, "zdoom", 5)) gameEngine = ENGINE_ZDOOM;
+				else if (!strncmp(namespaceStr, "srb2", 4)) gameEngine = ENGINE_SRB2;
+				else gameEngine = ENGINE_UNKNOWN;
+			}
+			// skip until semicolon
+			while (*ptr && *ptr != ';') ptr++;
+			if (*ptr == ';') ptr++;
+			continue;
+		}
+
+		// Read block header (skip leading whitespace and avoid consuming comments)
+		char headerBuf[64]; int hi = 0;
+
+		// read header token until whitespace, '{' or comment start
+		while (*ptr && *ptr != '{') {
+			if ((*ptr == '/' && (ptr[1] == '/' || ptr[1] == '*')) || isspace((unsigned char)*ptr)) break; // don't include comment start or whitespace in header
+			if (hi < (int)sizeof(headerBuf)-1) headerBuf[hi++] = *ptr;
+			ptr++;
+		}
+		headerBuf[hi] = '\0';
+
+		// If we didn't read a header (e.g. encountered comment or stray chars), skip comments and continue
+		if (!hi) {
+			// skip comments or stray characters until next top-level token
+			if (*ptr == '/' && ptr[1] == '/') { ptr += 2; while (*ptr && *ptr != '\n') ptr++; if (*ptr) ptr++; continue; }
+			if (*ptr == '/' && ptr[1] == '*') { ptr += 2; while (*ptr && !(ptr[0] == '*' && ptr[1] == '/')) ptr++; if (*ptr) ptr += 2; continue; }
+			// if we hit '{' without a header, just skip it
+			if (*ptr == '{') { ptr++; continue; }
+			// otherwise continue to next iteration
+			continue;
+		}
+
+		//Allocate space for the new block_t and add new block to the memory
+		blocks = (block_t*)realloc(blocks, (blockCount + 1) * sizeof(block_t));
+		block_t *blk = &blocks[blockCount];
+		memset(blk, 0, sizeof(block_t));
+		strncpy(blk->header, headerBuf, sizeof(blk->header)-1);
+
+		// skip whitespace/comments between header and '{'
+		while (*ptr) {
+			if (isspace((unsigned char)*ptr)) { ptr++; continue; }
+			if (*ptr == '/' && ptr[1] == '/') { ptr += 2; while (*ptr && *ptr != '\n') ptr++; if (*ptr) ptr++; continue; }
+			if (*ptr == '/' && ptr[1] == '*') { ptr += 2; while (*ptr && !(ptr[0] == '*' && ptr[1] == '/')) ptr++; if (*ptr) ptr += 2; continue; }
+			break;
+		}
+		if (*ptr == '{') ptr++;
+
+		// Parse fields inside block
+		while (*ptr) {
+			// skip whitespace and comments
+			if (*ptr == '/' && ptr[1] == '/') { ptr += 2; while (*ptr && *ptr != '\n') ptr++; if (*ptr) ptr++; continue; }
+			if (*ptr == '/' && ptr[1] == '*') { ptr += 2; while (*ptr && !(ptr[0]=='*' && ptr[1]=='/')) ptr++; if (*ptr) ptr += 2; continue; }
+			if (isspace((unsigned char)*ptr)) { ptr++; continue; }
+			if (*ptr == '}') { ptr++; break; }
+
+			// read key
+			char key[128]; int ki = 0;
+			while (*ptr && *ptr != '=' && *ptr != '}' && !isspace((unsigned char)*ptr)) {
+				if (ki < (int)sizeof(key)-1) key[ki++] = *ptr;
+				ptr++;
+			}
+			key[ki] = '\0';
+			while (isspace((unsigned char)*ptr)) ptr++;
+			if (*ptr == '=') ptr++;
+			while (isspace((unsigned char)*ptr)) ptr++;
+
+			// read value
+			char value[1024]; int vi = 0;
+			if (*ptr == '"') {
+				value[vi++] = '"'; ptr++;
+				while (*ptr && *ptr != '"') { if (vi < (int)sizeof(value)-1) value[vi++] = *ptr; ptr++; }
+				if (*ptr == '"') { if (vi < (int)sizeof(value)-1) value[vi++] = '"'; ptr++; }
+			} else {
+				while (*ptr && *ptr != ';' && *ptr != '}') { if (vi < (int)sizeof(value)-1) value[vi++] = *ptr; ptr++; }
+			}
+			value[vi] = '\0';
+
+			addField(blk, key, value);
+
+			// advance past semicolon if present
+			if (*ptr == ';') ptr++;
+		}
+
+		blockCount++;
+	}
+
+	// Remove trailing empty blocks
+	while (blockCount > 0 && blocks[blockCount - 1].fieldsCount == 0) {
+		free(blocks[blockCount - 1].fields);
+		blockCount--;
+	}
+}
+
 // Generate a new TEXTMAP using the blocks data from memory
-static char* generateTEXTMAP(block_t *blocks) {
+static char* TEXTMAP_GenerateNewDataFromBlocks(block_t *blocks) {
 	size_t allocated = 0x100000; //1 Megabyte
 	size_t used = 0;
 	char *out = (char*)malloc(allocated);
@@ -492,9 +812,9 @@ static char* generateTEXTMAP(block_t *blocks) {
 	for (unsigned int block = 0; block < blockCount; block++) {
 		memset(blockLine, 0, sizeof(blockLine));
 		//Make a line with block's data
-		for (unsigned int pair = 0; pair < blocks[block].pairsCount; pair++) {
-			if (!isFieldDefaultValue(&blocks[block].pairs[pair])) { //only write fields which are not set to default
-				snprintf(buffer_str, sizeof(buffer_str), "%s=%s;", blocks[block].pairs[pair].key, blocks[block].pairs[pair].value);
+		for (unsigned int pair = 0; pair < blocks[block].fieldsCount; pair++) {
+			if (!BOOL_IsFieldDefaultValue(&blocks[block].fields[pair])) { //only write fields which are not set to default
+				snprintf(buffer_str, sizeof(buffer_str), "%s=%s;", blocks[block].fields[pair].key, blocks[block].fields[pair].value);
 				strcat(blockLine, buffer_str);
 			}
 		}
@@ -515,23 +835,25 @@ static char* generateTEXTMAP(block_t *blocks) {
 // MAIN
 //
 int main(int argc, char *argv[]) {
+	puts("LESSUDMF v3.0 by LeonardoTheMutant\n");
+
 	if (argc < 2) {
-		printf("%s [input.wad] -o [output.wad] -m\n", argv[0]);
-		puts("Optimize the UDMF maps in WAD.\n");
+		printf("%s [input.wad] -o [output.wad] -nm\n", argv[0]);
+		puts("Optimize the UDMF maps data in WAD\n");
 		printf("    -o\tOutput to the file. If not given, the output will be written to %s\n", outputFilePath);
-		puts("    -m\tMerge identical sectors in maps. MAY ALSO MERGE AND BREAK SLOPED SECTORS!");
-		puts("\nMake sure to have a copy of the old file - new file can have corruptions!");
+		puts("    -nm\tDo not merge identical sectors in maps");
+		puts("\nAlways make sure to have a copy of the old file - new file can have corruptions!");
 		return 0;
 	}
 
 	// parse args
-	for (int i = 1; i < argc; ++i) {
-		if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) strncpy(outputFilePath, argv[++i], sizeof(outputFilePath) - 1);
-		else if (strcmp(argv[i], "-m") == 0) buffer_int |= 2;
+	for (int i = 1; i < argc; i++) {
+		if (strncmp(argv[i], "-o", 2) == 0 && i + 1 < argc) strncpy(outputFilePath, argv[++i], sizeof(outputFilePath) - 1);
+		else if (strncmp(argv[i], "-nm", 3) == 0) bufferA |= 2; //"No merge" option
 		else strncpy(buffer_str, argv[i], sizeof(buffer_str));
 	}
 
-	if (areSameFiles(buffer_str, outputFilePath)) { fprintf(stderr, "ERROR: Input and Output files are the same, please choose other Output file\n"); return 1; }
+	if (BOOL_AreSameFiles(buffer_str, outputFilePath)) { fprintf(stderr, "ERROR: Input and Output files are the same, please choose other Output file\n"); return 1; }
 
 	inputWAD = fopen(buffer_str, "rb");
 	if (!inputWAD) { fprintf(stderr, "ERROR: Failed to open Input WAD (%s)\n", buffer_str); return 1; }
@@ -543,24 +865,23 @@ int main(int argc, char *argv[]) {
 	fwrite(buffer_str, 1, 4, outputWAD);
 
 	//Get the amount of lumps in WAD and allocate the space for them
-	fread(&WADfile.lumpsAmount, 4, 1, inputWAD);
-	printf("%d lumps in WAD\n", WADfile.lumpsAmount);
-	fwrite(&WADfile.lumpsAmount, 4, 1, outputWAD);
-	lumps = (lump_t*)malloc(sizeof(lump_t) * WADfile.lumpsAmount);
+	fread(&WAD_LumpsAmount, 4, 1, inputWAD);
+	fwrite(&WAD_LumpsAmount, 4, 1, outputWAD);
+	lumps = (lump_t*)malloc(sizeof(lump_t) * WAD_LumpsAmount);
 	if (!lumps) { fprintf(stderr, "ERROR: Failed to allocate memory for the WAD lumps buffer"); closeIO(); return 1; }
 
 	//Get Directory Table address
-	fread(&WADfile.directory_adress, 4, 1, inputWAD);
+	fread(&WAD_DirectoryAddress, 4, 1, inputWAD);
 
-	// Prepare to write new WAD: write placeholder for directory address (we'll fill later)
+	// Prepare to write new WAD: write placeholder for the Directory Table address (we'll correct it at the end)
 	putc(0x0C, outputWAD);
 	for (char x=0; x<3; x++) putc(0, outputWAD);
 
 	// Seek to dir table, read it
-	fseek(inputWAD, WADfile.directory_adress, SEEK_SET);
-	puts("\nDirectory Table of Input WAD:");
+	fseek(inputWAD, WAD_DirectoryAddress, SEEK_SET);
+	puts("\nDirectory Table of the Input WAD:");
 	puts("\nID   ADRESS     SIZE     NAME");
-	for (int i = 0; i < WADfile.lumpsAmount; ++i) {
+	for (unsigned int i = 0; i < WAD_LumpsAmount; i++) {
 		fread(&lumps[i].adress, 4, 1, inputWAD);
 		fread(&lumps[i].size, 4, 1, inputWAD);
 		fread(lumps[i].name, 8, 1, inputWAD);
@@ -569,7 +890,7 @@ int main(int argc, char *argv[]) {
 
 	// Copy/modify lumps
 	fseek(inputWAD, 0x0C, SEEK_SET); //Jump back to the actuall lump data
-	for (int i = 0; i < WADfile.lumpsAmount; ++i) {
+	for (unsigned int i = 0; i < WAD_LumpsAmount; i++) {
 		// Set new lump address
 		lumps[i].adress = ftell(outputWAD);
 		if (strncmp(lumps[i].name, "TEXTMAP", 7)) {
@@ -581,60 +902,55 @@ int main(int argc, char *argv[]) {
 				free(LUMP_BUFFER);
 			}
 		} else {
-			// ---------- Modify TEXTMAP ----------
-			printf("\nModifying TEXTMAP of %s...\n", lumps[i-1].name);
+			//---------- Modify TEXTMAP ----------
+			printf("\nWorking on TEXTMAP of %s...\n", lumps[i-1].name);
 
-			// Load TEXTMAP
+			//Copy TEXTMAP to memory
 			LUMP_BUFFER = (char*)malloc(lumps[i].size + 1);
 			fread(LUMP_BUFFER, lumps[i].size, 1, inputWAD);
 			LUMP_BUFFER[lumps[i].size] = '\0';
 
-			// 1) Clean whitespace/comments
-			char *CLEANED_LUMP_BUFFER = cleanupTEXTMAP(LUMP_BUFFER, lumps[i].size, &lumps[i].size);
-			puts("Cleaned the text");
-
 			// Free old blocks if any
-			for (unsigned int b = 0; b < blockCount; ++b) {
-				for (size_t p = 0; p < blocks[b].pairsCount; ++p) {
-					free(blocks[b].pairs[p].key);
-					free(blocks[b].pairs[p].value);
+			for (unsigned int b = 0; b < blockCount; b++) {
+				for (size_t p = 0; p < blocks[b].fieldsCount; p++) {
+					free(blocks[b].fields[p].key);
+					free(blocks[b].fields[p].value);
 				}
-				free(blocks[b].pairs);
+				free(blocks[b].fields);
 			}
 			free(blocks);
 			blocks = 0;
 			blockCount = 0;
 
-			parseTEXTMAP(CLEANED_LUMP_BUFFER); //Tokenize the entire TEXTMAP
+			//Parse the TEXTMAP into data blocks for the program
+			TEXTMAP_Parse(LUMP_BUFFER);
+			printf("Analized the map, namespace is \"%s\"\n", namespaceStr);
+			free(LUMP_BUFFER); //Unload the lump because we no longer need the original data
 
-			// 2) Deduplicate (merge) identical sectors
-			if (buffer_int & 2) { //Was '-m' command line paramater activated?
-				deduplicateSectors(); //Deduplicate sectors
-			}
+			// Deduplicate (merge) identical sectors (enabled by default; disabled with -nm)
+			if (!(bufferA & 2)) MAP_DeduplicateSectors();
 
-			free(LUMP_BUFFER);
-			LUMP_BUFFER = generateTEXTMAP(blocks); //Write changes to the buffer
+			LUMP_BUFFER = TEXTMAP_GenerateNewDataFromBlocks(blocks); //Write new lump to the buffer
 			lumps[i].size = strlen(LUMP_BUFFER);
 
-			// 3) Write modified TEXTMAP
+			// Write the new TEXTMAP to the Output WAD
 			fwrite(LUMP_BUFFER, lumps[i].size, 1, outputWAD);
 			printf("Wrote the modified TEXTMAP data of %s to the output\n", lumps[i-1].name);
 
 			free(LUMP_BUFFER);
-			free(CLEANED_LUMP_BUFFER);
 		}
 	}
 
-	// Directory address
-	buffer_int = ftell(outputWAD);
-	fseek(outputWAD, 8, SEEK_SET);
-	fwrite(&buffer_int, 4, 1, outputWAD);
-	fseek(outputWAD, buffer_int, SEEK_SET);
+	// Directory Table address
+	bufferA = ftell(outputWAD); //where we are in the output WAD
+	fseek(outputWAD, 8, SEEK_SET); //go back to the Directory Table address pointer in WAD
+	fwrite(&bufferA, 4, 1, outputWAD); //write the address
+	fseek(outputWAD, bufferA, SEEK_SET); //get back to the Directory Table
 
-	//Write the new directory table
-	puts("\nDirectory Table of Output WAD:");
+	//Write the new Directory Table
+	puts("\nDirectory Table of the Output WAD:");
 	puts("\nID   ADRESS     SIZE     NAME");
-	for (int i = 0; i < WADfile.lumpsAmount; ++i) {
+	for (unsigned int i = 0; i < WAD_LumpsAmount; i++) {
 		printf("%2d %8d %8d %8s\n", i, lumps[i].adress, lumps[i].size, lumps[i].name);
 		fwrite(&lumps[i].adress, 4, 1, outputWAD);
 		fwrite(&lumps[i].size, 4, 1, outputWAD);
