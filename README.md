@@ -9,7 +9,7 @@ A tool to optimize UDMF maps data in WAD files
 - Remove UDMF fields from TEXTMAP which are set to default values
 
 ## How to use
-Run `LESSUMDF <input.wad>` from the terminal or drag&drop the WAD file onto the executable (in Windows) and get your WAD back with optimized UDMF maps inside. The WAD file size becomes smaller by 30% on average. **Always make sure you have a recovery copy of your Input WAD and check the contents of the Output WAD!**
+Run `LESSUMDF <input.wad>` from the terminal or drag&drop the WAD file onto the executable (in Windows) and get your WAD back with optimized UDMF maps inside. The WAD file size becomes smaller by 33% on average. **Always make sure you have a recovery copy of your Input WAD and check the contents of the Output WAD!**
 
 ## Command line parameters
 - `-o <file.wad>` - Output to the file. If not given, an `./OUTPUT.WAD` file will be created instead.
