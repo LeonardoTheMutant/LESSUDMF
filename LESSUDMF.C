@@ -1,13 +1,10 @@
-//"Less UDMF" version 4
+//"Less UDMF" version 4.1
 //A tool to optimize the UDMF maps data in WAD
 //Code by LeonardoTheMutant
 
-//Changes in version 4:
-// - Improved the support for different game engines by implementing config files that describe the game
-// - Fixed several bugs and improved memory management
-// - Added functionality to remove unnecessary textures from Control Linedefs
-// - Added functionality to remove angle information for no-angle things, since it is unnecessary
-// - Improved the functionality of default valued UDMF fields removal
+//Changes in version 4.1:
+// - Remade I/O to make reading & writing to the same WAD file possible
+// - Did string optimizations to reduce their size in the compiled executable
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,17 +13,6 @@
 #include <sys/stat.h>
 
 #include "json.h"
-
-//for areFilesSame()
-#if defined(_WIN32)
-	#include <direct.h>
-	#define realpath(N,R) _fullpath((R),(N),_MAX_PATH)
-	#define PATHCMP _stricmp
-#else
-	#include <limits.h>
-	#include <unistd.h>
-	#define PATHCMP strcmp
-#endif
 
 //Internal program flags
 enum flags {
@@ -64,13 +50,13 @@ enum {
 
 //Config files
 const char *configFiles[] = {
-	[ENGINE_UNKNOWN] = 0,
-	[ENGINE_DOOM] = "./DOOM.JSON",
-	[ENGINE_HERETIC] = "./HERETIC.JSON",
-	[ENGINE_HEXEN] = "./HEXEN.JSON",
-	[ENGINE_STRIFE] = "./STRIFE.JSON",
-	[ENGINE_ZDOOM] = "./ZDOOM.JSON",
-	[ENGINE_SRB2] = "./SRB2.JSON"
+	0,					//ENGINE_UNKNOWN, custom config filepath goes there
+	"./DOOM.JSON",		//ENGINE_DOOM
+	"./HERETIC.JSON",	//ENGINE_HERETIC
+	"./HEXEN.JSON",		//ENGINE_HEXEN
+	"./STRIFE.JSON",	//ENGINE_STRIFE
+	"./ZDOOM.JSON",		//ENGINE_ZDOOM
+	"./SRB2.JSON"		//ENGINE_SRB2
 };
 
 //Level elements
@@ -85,7 +71,7 @@ enum {
 //Lump
 typedef struct {
 	char name[8];
-	uint32_t adress;
+	uint32_t address;
 	uint32_t size;
 } lump_t;
 
@@ -112,7 +98,6 @@ typedef struct {
 
 typedef struct {
 	uint32_t filesize;
-	struct stat filestatus;
 	char *buffer;
 	json_value *json;
 	uint16_t *linedefSpecialsNoTexture;
@@ -127,7 +112,7 @@ block_t *blocks;
 uint32_t blockCount = 0;
 sector_t *sectors;
 uint32_t sectorCount;
-char *namespaceStr;
+char *namespaceValue;
 uint8_t gameEngine;
 uint8_t gameEngine_last = UINT8_MAX;
 
@@ -136,10 +121,13 @@ static FILE *outputWAD;
 static char outputFilePath[PATH_MAX] = "./OUTPUT.WAD";
 static FILE *configFile;
 config_t config;
+struct stat filestatus;
 
 static uint32_t bufferA = 0; //multipurpose
 static uint32_t bufferB = 0; //multipurpose
+static uint32_t OUTPUT_SIZE = 0;
 static char buffer_str[0x400];
+static char *OUTPUT_BUFFER;
 static char *LUMP_BUFFER;
 
 static uint32_t WAD_LumpsAmount;
@@ -148,19 +136,33 @@ static lump_t *lumps; //array of lumps loaded from the Input Wad
 
 static uint8_t FLAGS = 0;
 
-//Check if two filepaths refer to the same file
-char BOOL_AreSameFiles(const char *path1, const char *path2) {
-	char abs1[PATH_MAX], abs2[PATH_MAX];
-	if (!realpath(path1, abs1) || !realpath(path2, abs2))
-		return 0; // If either path can't be resolved, assume not the same
-	return !PATHCMP(abs1, abs2);
-}
-
-//Close I/O
-static void closeIO(void) {
-	if (inputWAD) { fclose(inputWAD); inputWAD = 0; }
-	if (outputWAD) { fclose(outputWAD); outputWAD = 0; }
-}
+//Constant strings that get reused multiple times
+const char DIRTABLE_STR[] = "\nID   ADRESS     SIZE     NAME";
+const char ERROR_STR[] = "ERROR:";
+const char WARNING_STR[] = "WARNING:";
+const char TEXTMAP_STR[] = "TEXTMAP";
+const char UDMF_STR[] = "UDMF";
+const char WAD_STR[] = "WAD";
+const char DONE_STR[] = "Done";
+const char INPUT_STR[] = "Input";
+const char OUTPUT_STR[] = "Output";
+const char NAMESPACE_STR[] = "namespace";
+const char VERTEX_STR[] = "vertex";
+const char LINEDEF_STR[] = "linedef";
+const char SIDEDEF_STR[] = "sidedef";
+const char SECTOR_STR[] = "sector";
+const char THING_STR[] = "thing";
+const char SIDEFRONT_STR[] = "sidefront";
+const char SIDEBACK_STR[] = "sideback";
+const char SPECIAL_STR[] = "special";
+const char ZFLOOR_STR[] = "zfloor";
+const char ZCEILING_STR[] = "zceiling";
+const char DEFAULTVALUES_STR[] = "defaultValues";
+const char FAILEDTO_STR[] = "Failed to";
+const char NOTFOUND_STR[] = "not found";
+const char ALLOCATEFOR_STR[] = "allocate memory for";
+const char CONFIGFILE_STR[] = "Config File";
+const char BYTES_STR[] = "bytes";
 
 //isspace() from ctype.h
 static uint8_t isspace(char c) {
@@ -187,7 +189,7 @@ static uint8_t BOOL_BlockHasField(const block_t *blk, const char *strkey) {
 static void addField(block_t *blk, const char *key, const char *value) {
 	field_t *tmp = (field_t*) realloc(blk->fields, (blk->fieldsCount + 1) * sizeof(field_t));
 	if (!tmp) {
-		fprintf(stderr, "Failed to reallocate memory for the new field in block\n");
+		fprintf(stderr, "%s %s re%s the new field in block\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
 		exit(1);
 	}
 	blk->fields = tmp;
@@ -195,7 +197,7 @@ static void addField(block_t *blk, const char *key, const char *value) {
 	blk->fields[blk->fieldsCount].key = strdup(key);
 	blk->fields[blk->fieldsCount].value = strdup(value);
 	if (!blk->fields[blk->fieldsCount].key || !blk->fields[blk->fieldsCount].value) {
-		fprintf(stderr, "addField: out of memory while copying strings\n");
+		fprintf(stderr, "%s addField: out of memory while copying strings\n", ERROR_STR);
 		exit(1);
 	}
 
@@ -216,7 +218,7 @@ static void removeField(block_t *blk, const char *key) {
 			if (blk->fieldsCount) {
 				blk->fields = (field_t*) realloc(blk->fields, blk->fieldsCount * sizeof(field_t));
 				if (!blk->fields) {
-					fprintf(stderr, "Failed to reallocate memory for the reduced fields array in block\n");
+					fprintf(stderr, "%s %s re%s the reduced fields array in block\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
 					exit(1);
 				}
 			} else {
@@ -263,11 +265,11 @@ static char CONFIG_Parse(config_t *config) {
 	json_value *j = config->json;
 
 	for (uint16_t x = 0; x < j->u.object.length; x++) {
-		if (!strncmp(j->u.object.values[x].name, "namespace", 9) && gameEngine != ENGINE_UNKNOWN) {
+		if (!strncmp(j->u.object.values[x].name, NAMESPACE_STR, 9) && gameEngine != ENGINE_UNKNOWN) {
 			//Cancel parsing if the config is made for another game
 
-			if (strcmp(j->u.object.values[x].value->u.string.ptr, namespaceStr)) {
-				fprintf(stderr, "ERROR: Config file is made for \"%s\", not for \"%s\" game engine\n", j->u.object.values[x].value->u.string.ptr, namespaceStr);
+			if (strcmp(j->u.object.values[x].value->u.string.ptr, namespaceValue)) {
+				fprintf(stderr, "%s %s is made for \"%s\", not for \"%s\" game engine\n", ERROR_STR, CONFIGFILE_STR, j->u.object.values[x].value->u.string.ptr, namespaceValue);
 				return 0;
 			}
 		}
@@ -275,7 +277,7 @@ static char CONFIG_Parse(config_t *config) {
 		//
 		// LINEDEF
 		//
-		else if (!strncmp(j->u.object.values[x].name, "linedef", 7) && j->u.object.values[x].value->type == json_object) {
+		else if (!strncmp(j->u.object.values[x].name, LINEDEF_STR, 7) && j->u.object.values[x].value->type == json_object) {
 
 			for (uint16_t i = 0; i < j->u.object.values[x].value->u.object.length; i++) {
 				bufferB = j->u.object.values[x].value->u.object.values[i].value->type;
@@ -289,7 +291,7 @@ static char CONFIG_Parse(config_t *config) {
 					//Allocate memory
 					config->linedefSpecialsNoTexture = (uint16_t *) malloc((bufferA + 1) * sizeof(uint16_t));
 					if (!config->linedefSpecialsNoTexture) {
-						fprintf(stderr, "ERROR: Failed to allocate memory for the non-textured Linedef Special types array");
+						fprintf(stderr, "%s %s %s the non-textured Linedef Special types array", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
 						return 0;
 					}
 
@@ -310,7 +312,7 @@ static char CONFIG_Parse(config_t *config) {
 					//Allocate memory
 					config->linedefSpecialsSlope = (uint16_t *) malloc((bufferA + 1) * sizeof(uint16_t));
 					if (!config->linedefSpecialsSlope) {
-						fprintf(stderr, "ERROR: Failed to allocate memory for the slope Linedef Special types array");
+						fprintf(stderr, "%s %s %s the slope Linedef Special types array", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
 						return 0;
 					}
 
@@ -322,7 +324,7 @@ static char CONFIG_Parse(config_t *config) {
 					config->linedefSpecialsSlope[bufferA] = 0;
 				}
 
-				else if (!strcmp(j->u.object.values[x].value->u.object.values[i].name, "defaultValues") && bufferB == json_object) {
+				else if (!strcmp(j->u.object.values[x].value->u.object.values[i].name, DEFAULTVALUES_STR) && bufferB == json_object) {
 					//found array containing default field values for Linedefs
 
 					bufferA = j->u.object.values[x].value->u.object.values[i].value->u.object.length;
@@ -331,7 +333,7 @@ static char CONFIG_Parse(config_t *config) {
 					//Allocate memory
 					config->defaultValues[LEVEL_LINEDEF] = (field_t *) malloc((bufferA + 1) * sizeof(field_t));
 					if (!config->defaultValues[LEVEL_LINEDEF]) {
-						fprintf(stderr, "ERROR: Failed to allocate memory for the Linedef default values list");
+						fprintf(stderr, "%s %s %s the Linedef default values list", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
 						return 0;
 					}
 
@@ -350,12 +352,12 @@ static char CONFIG_Parse(config_t *config) {
 		//
 		// SIDEDEF
 		//
-		else if (!strncmp(j->u.object.values[x].name, "sidedef", 7) && j->u.object.values[x].value->type == json_object) {
+		else if (!strncmp(j->u.object.values[x].name, SIDEDEF_STR, 7) && j->u.object.values[x].value->type == json_object) {
 
 			for (uint16_t i = 0; i < j->u.object.values[x].value->u.object.length; i++) {
 				bufferB = j->u.object.values[x].value->u.object.values[i].value->type;
 
-				if (!strcmp(j->u.object.values[x].value->u.object.values[i].name, "defaultValues") && bufferB == json_object) {
+				if (!strcmp(j->u.object.values[x].value->u.object.values[i].name, DEFAULTVALUES_STR) && bufferB == json_object) {
 					//found array containing default field values for Sidedefs
 
 					bufferA = j->u.object.values[x].value->u.object.values[i].value->u.object.length;
@@ -364,7 +366,7 @@ static char CONFIG_Parse(config_t *config) {
 					//Allocate memory
 					config->defaultValues[LEVEL_SIDEDEF] = (field_t *) malloc((bufferA + 1) * sizeof(field_t));
 					if (!config->defaultValues[LEVEL_SIDEDEF]) {
-						fprintf(stderr, "ERROR: Failed to allocate memory for the Sidedef default values list");
+						fprintf(stderr, "%s %s %s the Sidedef default values list", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
 						return 0;
 					}
 
@@ -383,7 +385,7 @@ static char CONFIG_Parse(config_t *config) {
 		//
 		// SECTOR
 		//
-		else if (!strncmp(j->u.object.values[x].name, "sector", 6) && j->u.object.values[x].value->type == json_object) {
+		else if (!strncmp(j->u.object.values[x].name, SECTOR_STR, 6) && j->u.object.values[x].value->type == json_object) {
 
 			for (uint16_t i = 0; i < j->u.object.values[x].value->u.object.length; i++) {
 				bufferB = j->u.object.values[x].value->u.object.values[i].value->type;
@@ -404,7 +406,7 @@ static char CONFIG_Parse(config_t *config) {
 					//Allocate memory for the array
 					config->sectorFieldsSlope = (char**) malloc((bufferA + 1) * sizeof(char*));
 					if (!config->sectorFieldsSlope) {
-						fprintf(stderr, "ERROR: Failed to allocate memory for the slope Sector fields array");
+						fprintf(stderr, "%s %s %s the slope Sector fields array", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
 						return 0;
 					}
 
@@ -413,7 +415,7 @@ static char CONFIG_Parse(config_t *config) {
 						//copy the string
 						config->sectorFieldsSlope[a] = strdup(j->u.object.values[x].value->u.object.values[i].value->u.array.values[a]->u.string.ptr);
 						if (!config->sectorFieldsSlope[a]) {
-							fprintf(stderr, "ERROR: Failed to allocate memory for string (array index %d) in the slope Sector fields array", a);
+							fprintf(stderr, "%s %s %s string (array index %d) in the slope Sector fields array", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, a);
 							return 0;
 						}
 					}
@@ -421,7 +423,7 @@ static char CONFIG_Parse(config_t *config) {
 					config->sectorFieldsSlope[bufferA] = 0;
 				}
 
-				else if (!strcmp(j->u.object.values[x].value->u.object.values[i].name, "defaultValues") && bufferB == json_object) {
+				else if (!strcmp(j->u.object.values[x].value->u.object.values[i].name, DEFAULTVALUES_STR) && bufferB == json_object) {
 					//found array containing default field values for Sectors
 
 					bufferA = j->u.object.values[x].value->u.object.values[i].value->u.object.length;
@@ -430,7 +432,7 @@ static char CONFIG_Parse(config_t *config) {
 					//Allocate memory
 					config->defaultValues[LEVEL_SECTOR] = (field_t *) malloc((bufferA + 1) * sizeof(field_t));
 					if (!config->defaultValues[LEVEL_SECTOR]) {
-						fprintf(stderr, "ERROR: Failed to allocate memory for the Sector default values list");
+						fprintf(stderr, "%s %s %s the Sector default values list", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
 						return 0;
 					}
 
@@ -449,7 +451,7 @@ static char CONFIG_Parse(config_t *config) {
 		//
 		// THING
 		//
-		else if (!strncmp(j->u.object.values[x].name, "thing", 5) && j->u.object.values[x].value->type == json_object) {
+		else if (!strncmp(j->u.object.values[x].name, THING_STR, 5) && j->u.object.values[x].value->type == json_object) {
 
 			for (uint16_t i = 0; i < j->u.object.values[x].value->u.object.length; i++) {
 				bufferB = j->u.object.values[x].value->u.object.values[i].value->type;
@@ -463,7 +465,7 @@ static char CONFIG_Parse(config_t *config) {
 					//Allocate memory for the array
 					config->thingTypesNoAngle = (uint16_t*) malloc((bufferA + 1) * sizeof(uint16_t));
 					if (!config->thingTypesNoAngle) {
-						fprintf(stderr, "ERROR: Failed to allocate memory for the no angle Things array");
+						fprintf(stderr, "%s %s %s the no angle Things array", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
 						return 0;
 					}
 
@@ -475,7 +477,7 @@ static char CONFIG_Parse(config_t *config) {
 					config->thingTypesNoAngle[bufferA] = 0;
 				}
 
-				else if (!strcmp(j->u.object.values[x].value->u.object.values[i].name, "defaultValues") && bufferB == json_object) {
+				else if (!strcmp(j->u.object.values[x].value->u.object.values[i].name, DEFAULTVALUES_STR) && bufferB == json_object) {
 					//found array containing default field values for Things
 
 					bufferA = j->u.object.values[x].value->u.object.values[i].value->u.object.length;
@@ -484,7 +486,7 @@ static char CONFIG_Parse(config_t *config) {
 					//Allocate memory
 					config->defaultValues[LEVEL_THING] = (field_t *) malloc((bufferA + 1) * sizeof(field_t));
 					if (!config->defaultValues[LEVEL_THING]) {
-						fprintf(stderr, "ERROR: Failed to allocate memory for the Thing default values list");
+						fprintf(stderr, "%s %s %s the Thing default values list", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
 						return 0;
 					}
 
@@ -543,8 +545,8 @@ static block_t **LINEDEF_GetSidedefs(block_t *linedef, uint8_t *sidesCount) {
 	block_t **sidedefs;
 	sidedefs = (block_t**) malloc(sizeof(block_t*) * 2);
 	*sidesCount = 0;
-	const char *sidefront_str = getFieldValueFromBlock(linedef, "sidefront");
-	const char *sideback_str  = getFieldValueFromBlock(linedef, "sideback");
+	const char *sidefront_str = getFieldValueFromBlock(linedef, SIDEFRONT_STR);
+	const char *sideback_str  = getFieldValueFromBlock(linedef, SIDEBACK_STR);
 	int32_t sidefront = -1, sideback = -1;
 	if (sidefront_str) sidefront = strtol(sidefront_str, 0, 10);
 	if (sideback_str)  sideback  = strtol(sideback_str,  0, 10);
@@ -553,7 +555,7 @@ static block_t **LINEDEF_GetSidedefs(block_t *linedef, uint8_t *sidesCount) {
 	uint8_t found = 0;
 	int32_t idx = 0;
 	for (uint32_t i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "sidedef", 7)) {
+		if (!strncmp(blocks[i].header, SIDEDEF_STR, 7)) {
 			if (idx == sidefront && sidefront >= 0) {
 				sidedefs[0] = &blocks[i];
 				found++;
@@ -585,8 +587,8 @@ static block_t **SECTOR_GetLinedefs(uint32_t sectorIndex, uint32_t *outCount) {
 	snprintf(buffer_str, sizeof(buffer_str), "%u", sectorIndex);
 
 	for (uint32_t i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "sidedef", 7)) {
-			const char *sec = getFieldValueFromBlock(&blocks[i], "sector");
+		if (!strncmp(blocks[i].header, SIDEDEF_STR, 7)) {
+			const char *sec = getFieldValueFromBlock(&blocks[i], SECTOR_STR);
 			if (sec) {
 				uint32_t sval = strtol(sec, 0, 10);
 				if (sval == sectorIndex) {
@@ -607,11 +609,11 @@ static block_t **SECTOR_GetLinedefs(uint32_t sectorIndex, uint32_t *outCount) {
 	block_t **found = 0;
 	bufferA = 0; //found linedefs count
 	for (uint32_t i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "linedef", 7)) {
+		if (!strncmp(blocks[i].header, LINEDEF_STR, 7)) {
 			// examine each pair in the linedef; if any numeric value equals a matching sidedef index, record it
 			for (uint8_t p = 0; p < blocks[i].fieldsCount; p++) {
 				// check for sidedef references
-				if (!strncmp(blocks[i].fields[p].key, "sidefront", 9) || !strncmp(blocks[i].fields[p].key, "sideback", 8)) {
+				if (!strncmp(blocks[i].fields[p].key, SIDEFRONT_STR, 9) || !strncmp(blocks[i].fields[p].key, SIDEBACK_STR, 8)) {
 					int32_t iv = strtol(blocks[i].fields[p].value, 0, 10);
 					if (iv >= 0) {
 						// compare against matchingSides
@@ -646,8 +648,8 @@ static block_t **SECTOR_GetPolygonVertices(uint32_t sectorIndex, uint32_t *outCo
 	bufferB = 0; //sidedef count
 	int32_t *sidedefIndices = 0;
 	for (uint32_t i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "sidedef", 7)) {
-			const char *sec = getFieldValueFromBlock(&blocks[i], "sector");
+		if (!strncmp(blocks[i].header, SIDEDEF_STR, 7)) {
+			const char *sec = getFieldValueFromBlock(&blocks[i], SECTOR_STR);
 			if (sec) {
 				uint32_t sval = strtol(sec, 0, 10);
 				if (sval == sectorIndex) {
@@ -665,7 +667,7 @@ static block_t **SECTOR_GetPolygonVertices(uint32_t sectorIndex, uint32_t *outCo
 
 	// Build vertex list (ordered by occurrence) to index into
 	bufferA = 0; //total vertices
-	for (uint32_t i = 0; i < blockCount; i++) if (!strncmp(blocks[i].header, "vertex", 6)) bufferA++;
+	for (uint32_t i = 0; i < blockCount; i++) if (!strncmp(blocks[i].header, VERTEX_STR, 6)) bufferA++;
 	if (!bufferA) { //
 		free(sidedefIndices);
 		return 0;
@@ -673,17 +675,17 @@ static block_t **SECTOR_GetPolygonVertices(uint32_t sectorIndex, uint32_t *outCo
 
 	block_t **vertexList = (block_t**)malloc(bufferA * sizeof(block_t*));
 	uint32_t vi = 0;
-	for (uint32_t i = 0; i < blockCount; i++) if (!strncmp(blocks[i].header, "vertex", 6)) vertexList[vi++] = &blocks[i];
+	for (uint32_t i = 0; i < blockCount; i++) if (!strncmp(blocks[i].header, VERTEX_STR, 6)) vertexList[vi++] = &blocks[i];
 
 	// Second pass: for every linedef, if it references any of the sidedefIndices, collect its v1/v2
 	block_t **found = 0;
 	uint32_t foundCount = 0;
 	for (uint32_t i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "linedef", 7)) {
+		if (!strncmp(blocks[i].header, LINEDEF_STR, 7)) {
 			// check fields for sidefront/sideback
 			char referencesSector = 0;
 			for (uint16_t p = 0; p < blocks[i].fieldsCount; ++p) {
-				if (!strncmp(blocks[i].fields[p].key, "sidefront", 9) || !strncmp(blocks[i].fields[p].key, "sideback", 8)) {
+				if (!strncmp(blocks[i].fields[p].key, SIDEFRONT_STR, 9) || !strncmp(blocks[i].fields[p].key, SIDEBACK_STR, 8)) {
 					int32_t iv = strtol(blocks[i].fields[p].value, 0, 10);
 					if (iv >= 0) {
 						for (uint32_t m = 0; m < bufferB; m++) {
@@ -741,7 +743,7 @@ static char BOOL_IsSectorSloped(uint32_t sectorIndex) {
 	// Inspect collected linedefs for slope-creating properties (conservative)
 	if (config.linedefSpecialsSlope) {
 		for (uint32_t i = 0; i < bufferA; i++) {
-			const char *specs = getFieldValueFromBlock(linedefs[i], "special");
+			const char *specs = getFieldValueFromBlock(linedefs[i], SPECIAL_STR);
 			bufferB = strtol(specs ? specs : "0", 0, 10); //Linedef special number
 
 			for (uint16_t s = 0; config.linedefSpecialsSlope[s]; s++) {
@@ -767,8 +769,8 @@ static char BOOL_IsSectorSloped(uint32_t sectorIndex) {
 			for (uint32_t pv = 0; pv < bufferA; pv++) {
 
 				const char *zstr = 0;
-				if (BOOL_BlockHasField(polyVertices[pv], "zfloor")) zstr = getFieldValueFromBlock(polyVertices[pv], "zfloor");
-				else if (BOOL_BlockHasField(polyVertices[pv], "zceiling")) zstr = getFieldValueFromBlock(polyVertices[pv], "zceiling");
+				if (BOOL_BlockHasField(polyVertices[pv], ZFLOOR_STR)) zstr = getFieldValueFromBlock(polyVertices[pv], ZFLOOR_STR);
+				else if (BOOL_BlockHasField(polyVertices[pv], ZCEILING_STR)) zstr = getFieldValueFromBlock(polyVertices[pv], ZCEILING_STR);
 
 				if (zstr && *zstr) {
 					double zv = strtod(zstr, 0);
@@ -807,9 +809,9 @@ static void MAP_RemoveControlLineTextures() {
 	for (uint32_t x = 0; x < blockCount; x++) {
 		b = &blocks[x];
 
-		if (!strncmp(b->header, "linedef", 7)) {
+		if (!strncmp(b->header, LINEDEF_STR, 7)) {
 			for (uint8_t i = 0; i < b->fieldsCount; i++) {
-				if (!strncmp(b->fields[i].key, "special", 7)) {
+				if (!strncmp(b->fields[i].key, SPECIAL_STR, 7)) {
 					for (uint16_t a = 0; config.linedefSpecialsNoTexture[a]; a++) {
 						if (strtol(b->fields[i].value, 0, 10) == config.linedefSpecialsNoTexture[a]) {
 							uint8_t numSides;
@@ -828,7 +830,7 @@ static void MAP_RemoveControlLineTextures() {
 			}
 		}
 	}
-	puts("Done");
+	puts(DONE_STR);
 }
 
 static void MAP_MergeSectors() {
@@ -837,13 +839,13 @@ static void MAP_MergeSectors() {
 	sectorCount = 0;
 	//Count the amount of sectors in map
 	for (uint32_t i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "sector", 6)) sectorCount++;
+		if (!strncmp(blocks[i].header, SECTOR_STR, 6)) sectorCount++;
 	}
 	sectors = (sector_t*)calloc(sectorCount, sizeof(sector_t)); //Allocate the space for sectors
 	//Load sectors
 	bufferA = 0; //Sector counter
 	for (uint32_t i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "sector", 6)) sectors[bufferA++].block = &blocks[i];
+		if (!strncmp(blocks[i].header, SECTOR_STR, 6)) sectors[bufferA++].block = &blocks[i];
 	}
 	// Mark all sectors as unvisited by the program
 	for (uint32_t i = 0; i < sectorCount; i++) sectors[i].isMaster = -1;
@@ -883,13 +885,13 @@ static void MAP_MergeSectors() {
 	block_t *sidedefs;
 	uint32_t sidedefCount = 0;
 	for (uint32_t i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "sidedef", 7)) sidedefCount++;
+		if (!strncmp(blocks[i].header, SIDEDEF_STR, 7)) sidedefCount++;
 	}
 	//Load Sidedefs
 	sidedefs = (block_t*)malloc(sizeof(block_t) * sidedefCount); //Allocate space for sidedefs
 	bufferA = 0; //Sidedef counter
 	for (uint32_t i = 0; i < blockCount; i++) {
-		if (!strncmp(blocks[i].header, "sidedef", 7)) sidedefs[bufferA++] = blocks[i];
+		if (!strncmp(blocks[i].header, SIDEDEF_STR, 7)) sidedefs[bufferA++] = blocks[i];
 	}
 
 	// Build masterID -> new compacted index
@@ -906,7 +908,7 @@ static void MAP_MergeSectors() {
 	// Remap sidedef sector indices
 	for (uint32_t i = 0; i < sidedefCount; i++) {
 		for (uint16_t j = 0; j < sidedefs[i].fieldsCount; j++) {
-			if (!strncmp(sidedefs[i].fields[j].key, "sector", 6)) {
+			if (!strncmp(sidedefs[i].fields[j].key, SECTOR_STR, 6)) {
 				uint32_t sectorIndex = strtol(sidedefs[i].fields[j].value, 0, 10);
 				
 				if (sectorIndex < sectorCount) {
@@ -915,7 +917,7 @@ static void MAP_MergeSectors() {
 					sidedefs[i].fields[j].value = strdup(buffer_str);
 					free(old); old = 0;
 				} else {
-					fprintf(stderr, "WARNING: Invalid or out-of-bounds sector index '%s' for sidedef, setting to 0\n", sidedefs[i].fields[j].value);
+					fprintf(stderr, "%s Invalid or out-of-bounds sector index '%s' for sidedef, setting to 0\n", WARNING_STR, sidedefs[i].fields[j].value);
 					strcpy(sidedefs[i].fields[j].value, "0");
 				}
 			}
@@ -928,7 +930,7 @@ static void MAP_MergeSectors() {
 	bufferA = 0; //track which sector we're looking at in sector[]
 
 	for (uint32_t i = 0; i < blockCount; i++) {
-		if (strncmp(blocks[i].header, "sector", 6)) {
+		if (strncmp(blocks[i].header, SECTOR_STR, 6)) {
 			//Not a sector block, just keep the block
 			if (writeIndex != i) blocks[writeIndex] = blocks[i];
 			writeIndex++;
@@ -954,7 +956,7 @@ static void MAP_MergeSectors() {
 
 	blockCount = writeIndex;
 
-	printf("Done (before: %d, after: %d)\n", sectorCount, uniqueSectorID);
+	printf("%s (before: %d, after: %d)\n", DONE_STR, sectorCount, uniqueSectorID);
 
 	free(sectors);
 	free(sidedefs);
@@ -969,7 +971,7 @@ static void MAP_NoAngleThings() {
 	for (uint32_t x = 0; x < blockCount; x++) {
 		b = &blocks[x];
 
-		if (!strncmp(b->header, "thing", 5)) {
+		if (!strncmp(b->header, THING_STR, 5)) {
 			for (uint8_t i = 0; i < b->fieldsCount; i++) {
 				if (!strncmp(b->fields[i].key, "type", 7)) {
 					for (uint16_t a = 0; config.thingTypesNoAngle[a]; a++) {
@@ -984,18 +986,18 @@ static void MAP_NoAngleThings() {
 		}
 	}
 
-	printf("Done (%u things)\n", bufferA);
+	printf("%s (%u things)\n", DONE_STR, bufferA);
 }
 
 //Remove UDMF fields that match the default values
 static void MAP_RemoveDefaultValues() {
-	printf("Removing UDMF fields that match the default values... ");
+	printf("Removing %s fields that match the default values... ", UDMF_STR);
 	uint8_t levelElement;
 	for (uint32_t b = 0; b < blockCount; b++) { // for each block
-		if (!strncmp(blocks[b].header, "linedef", 7)) levelElement = LEVEL_LINEDEF;
-		else if (!strncmp(blocks[b].header, "sidedef", 7)) levelElement = LEVEL_SIDEDEF;
-		else if (!strncmp(blocks[b].header, "sector", 6)) levelElement = LEVEL_SECTOR;
-		else if (!strncmp(blocks[b].header, "thing", 5)) levelElement = LEVEL_THING;
+		if (!strncmp(blocks[b].header, LINEDEF_STR, 7)) levelElement = LEVEL_LINEDEF;
+		else if (!strncmp(blocks[b].header, SIDEDEF_STR, 7)) levelElement = LEVEL_SIDEDEF;
+		else if (!strncmp(blocks[b].header, SECTOR_STR, 6)) levelElement = LEVEL_SECTOR;
+		else if (!strncmp(blocks[b].header, THING_STR, 5)) levelElement = LEVEL_THING;
 		else continue;
 
 		uint8_t y = 0;
@@ -1011,7 +1013,7 @@ static void MAP_RemoveDefaultValues() {
 			if (!match) y++;
 		}
 	}
-	puts("Done");
+	puts(DONE_STR);
 }
 
 //Tokenize TEXTMAP into block structures (block_t)
@@ -1028,7 +1030,7 @@ static void TEXTMAP_Parse(char *textmapdata) {
 		if (isspace(*ptr)) { ptr++; continue; }
 
 		// namespace
-		if (!strncmp(ptr, "namespace", 9)) {
+		if (!strncmp(ptr, NAMESPACE_STR, 9)) {
 			ptr += 9;
 			while (isspace(*ptr)) ptr++;
 			if (*ptr == '=') ptr++;
@@ -1038,9 +1040,9 @@ static void TEXTMAP_Parse(char *textmapdata) {
 				char *start = ptr;
 				while (*ptr && *ptr != '"') ptr++;
 				size_t len = ptr - start;
-				namespaceStr = (char*)malloc(len + 1);
-				memcpy(namespaceStr, start, len);
-				namespaceStr[len] = '\0';
+				namespaceValue = (char*)malloc(len + 1);
+				memcpy(namespaceValue, start, len);
+				namespaceValue[len] = '\0';
 				if (*ptr == '"') ptr++;
 			}
 
@@ -1048,13 +1050,13 @@ static void TEXTMAP_Parse(char *textmapdata) {
 			if (FLAGS & FLAGS_CUSTOMCONFIG) {
 				gameEngine = ENGINE_UNKNOWN;
 			} else {
-				if (namespaceStr) {
-					if (!strncmp(namespaceStr, "doom", 4)) gameEngine = ENGINE_DOOM;
-					else if (!strncmp(namespaceStr, "heretic", 7)) gameEngine = ENGINE_HERETIC;
-					else if (!strncmp(namespaceStr, "hexen", 5)) gameEngine = ENGINE_HEXEN;
-					else if (!strncmp(namespaceStr, "strife", 6)) gameEngine = ENGINE_STRIFE;
-					else if (!strncmp(namespaceStr, "zdoom", 5)) gameEngine = ENGINE_ZDOOM;
-					else if (!strncmp(namespaceStr, "srb2", 4)) gameEngine = ENGINE_SRB2;
+				if (namespaceValue) {
+					if (!strncmp(namespaceValue, "doom", 4)) gameEngine = ENGINE_DOOM;
+					else if (!strncmp(namespaceValue, "heretic", 7)) gameEngine = ENGINE_HERETIC;
+					else if (!strncmp(namespaceValue, "hexen", 5)) gameEngine = ENGINE_HEXEN;
+					else if (!strncmp(namespaceValue, "strife", 6)) gameEngine = ENGINE_STRIFE;
+					else if (!strncmp(namespaceValue, "zdoom", 5)) gameEngine = ENGINE_ZDOOM;
+					else if (!strncmp(namespaceValue, "srb2", 4)) gameEngine = ENGINE_SRB2;
 					else gameEngine = ENGINE_UNKNOWN;
 				} else {
 					gameEngine = ENGINE_UNKNOWN;
@@ -1156,11 +1158,11 @@ static char* TEXTMAP_Generate(block_t *blocks) {
 	uint32_t used = 0;
 	char *out = (char*)malloc(allocated);
 	if (!out) {
-		fprintf(stderr, "Failed to allocate memory for the new TEXTMAP lump\n");
+		fprintf(stderr, "%s %s %s the new %s lump\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, TEXTMAP_STR);
 		return 0;
 	}
 
-	used += snprintf(out, allocated, "namespace=\"%s\";", namespaceStr);
+	used += snprintf(out, allocated, "%s=\"%s\";", NAMESPACE_STR, namespaceValue);
 
 	for (uint32_t b = 0; b < blockCount; b++) {
 		//Calculate the character length of the block we are about to write
@@ -1174,7 +1176,7 @@ static char* TEXTMAP_Generate(block_t *blocks) {
 			allocated *= 2;
 			out = (char*) realloc(out, allocated);
 			if (!out) {
-				fprintf(stderr, "Failed to reallocate memory for the new TEXTMAP lump (%u bytes)\n", allocated);
+				fprintf(stderr, "%s %s re%s the new %s lump (%u %s)\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, TEXTMAP_STR, allocated, BYTES_STR);
 				return 0;
 			}
 		}
@@ -1192,7 +1194,7 @@ static char* TEXTMAP_Generate(block_t *blocks) {
         allocated += 2;
         out = (char*) realloc(out, allocated);
 		if (!out) {
-			fprintf(stderr, "Failed to reallocate memory for the new TEXTMAP lump (%u bytes)\n", allocated);
+			fprintf(stderr, "%s %s re%s the new %s lump (%u %s)\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, TEXTMAP_STR, allocated, BYTES_STR);
 			return 0;
 		}
     }
@@ -1209,14 +1211,14 @@ int main(int argc, char *argv[]) {
 	puts("LESSUDMF v4.0 by LeonardoTheMutant\n");
 
 	if (argc < 2) {
-		printf("%s <input.wad> [-o <output.wad>] ...\n", argv[0]);
-		puts("Optimize the UDMF maps data in WAD\n");
-		printf("    -o <output.wad>\tOutput to the file. If not given, the output will be written to %s\n", outputFilePath);
+		printf("%s <%s.%s> [-o <%s.%s>] ...\n", argv[0], INPUT_STR, WAD_STR, OUTPUT_STR, WAD_STR);
+		printf("Optimize the %s maps data in %s\n", UDMF_STR, WAD_STR);
+		printf("    -o <%s.%s>\t%s to the file. If not given, the %s will be written to %s\n", OUTPUT_STR, WAD_STR, OUTPUT_STR, OUTPUT_STR, outputFilePath);
 		puts("    -c <config.json>\tLoad custom game engine configuration");
 		puts("    -t\t\tPreserve textures on control linedefs with line specials that do not use them");
 		puts("    -s\t\tPreserve information about identical sectors, do not merge them with each other");
 		puts("    -a\t\tPreserve angle facing information for things that are no-angle");
-		puts("    -f\t\tPreserve the UDMF fields which are set to default values");
+		printf("    -f\t\tPreserve the %s fields which are set to default values\n", UDMF_STR);
 		puts("\nAlways make sure to have a copy of the old file - new file can have corruptions!");
 		return 0;
 	}
@@ -1227,7 +1229,7 @@ int main(int argc, char *argv[]) {
 		else if (!strncmp(argv[i], "-c", 2) && i + 1 < argc) { //custom game configuration
 			i++;
 			configFiles[ENGINE_UNKNOWN] = strdup(argv[i]);
-			if (!configFiles[ENGINE_UNKNOWN]) fprintf(stderr, "Failed to allocate memory for the Config File (%d bytes)\n", config.filesize);
+			if (!configFiles[ENGINE_UNKNOWN]) fprintf(stderr, "%s %s %s the %s (%d %s)\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, CONFIGFILE_STR, config.filesize, BYTES_STR);
 			FLAGS |= FLAGS_CUSTOMCONFIG; //"Using custom config file"
 		}
 		else if (!strncmp(argv[i], "-t", 2)) FLAGS |= FLAG_PRESERVETEXTURES; //"No texture removal"
@@ -1237,60 +1239,67 @@ int main(int argc, char *argv[]) {
 		else strncpy(buffer_str, argv[i], sizeof(buffer_str));
 	}
 
-	if (BOOL_AreSameFiles(buffer_str, outputFilePath)) { fprintf(stderr, "ERROR: Input and Output files are the same, please choose other Output file\n"); return 1; }
+	if (stat(buffer_str, &filestatus)) {
+		fprintf(stderr, "%s %s file \"%s\" %s\n", ERROR_STR, INPUT_STR, buffer_str, NOTFOUND_STR);
+		return 1;
+	}
+
+	OUTPUT_BUFFER = (char*) malloc(filestatus.st_size * sizeof(char));
 
 	inputWAD = fopen(buffer_str, "rb");
-	if (!inputWAD) { fprintf(stderr, "ERROR: Failed to open Input WAD (%s)\n", buffer_str); return 1; }
-	outputWAD = fopen(outputFilePath, "wb");
-	if (!outputWAD) { fprintf(stderr, "ERROR: Failed to open Output WAD (%s)\n", outputFilePath); closeIO(); return 1; }
+	if (!inputWAD) { fprintf(stderr, "%s %s to open %s %s (%s)\n", ERROR_STR, FAILEDTO_STR, INPUT_STR, WAD_STR, buffer_str); return 1; }
 
 	memset(buffer_str, 0, sizeof(buffer_str));
 
 	//Read the WAD type
 	fread(buffer_str, 1, 4, inputWAD);
-	if (strncmp(buffer_str + 1, "WAD", 3)) { fprintf(stderr, "ERROR: Bad Input WAD header\n"); closeIO(); return 1; }
-	fwrite(buffer_str, 1, 4, outputWAD);
+	if (strncmp(buffer_str + 1, WAD_STR, 3)) { fprintf(stderr, "%s %s Bad %s %s header\n", ERROR_STR, ERROR_STR, INPUT_STR, WAD_STR); fclose(inputWAD); inputWAD = 0; return 1; }
+	memcpy(OUTPUT_BUFFER, buffer_str, 4);
+	OUTPUT_SIZE += 4;
 
 	//Get the amount of lumps in WAD and allocate the space for them
 	fread(&WAD_LumpsAmount, 4, 1, inputWAD);
-	fwrite(&WAD_LumpsAmount, 4, 1, outputWAD);
+	memcpy(OUTPUT_BUFFER + OUTPUT_SIZE, &WAD_LumpsAmount, 4);
+	OUTPUT_SIZE += 4;
 	lumps = (lump_t*) malloc(sizeof(lump_t) * WAD_LumpsAmount);
-	if (!lumps) { fprintf(stderr, "ERROR: Failed to allocate memory for the WAD lumps buffer"); closeIO(); return 1; }
+	if (!lumps) { fprintf(stderr, "%s %s %s the %s lumps buffer", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, WAD_STR); fclose(inputWAD); inputWAD = 0; return 1; }
 
 	//Get Directory Table address
 	fread(&WAD_DirectoryAddress, 4, 1, inputWAD);
 
-	// Prepare to write new WAD: write placeholder for the Directory Table address (we'll correct it at the end)
-	putc(0x0C, outputWAD);
-	for (uint8_t x=0; x<3; x++) putc(0, outputWAD);
+	// Ignore the Directory Table address in the Output WAD for now, we'll correct it at the end
+	OUTPUT_SIZE += 4;
 
 	// Seek to dir table, read it
 	fseek(inputWAD, WAD_DirectoryAddress, SEEK_SET);
-	puts("Directory Table of the Input WAD:");
-	puts("\nID   ADRESS     SIZE     NAME");
+	printf("Directory Table of the %s %s:", INPUT_STR, WAD_STR);
+	puts(DIRTABLE_STR);
 	for (uint16_t i = 0; i < WAD_LumpsAmount; i++) {
-		fread(&lumps[i].adress, 4, 1, inputWAD);
+		fread(&lumps[i].address, 4, 1, inputWAD);
 		fread(&lumps[i].size, 4, 1, inputWAD);
 		fread(lumps[i].name, 8, 1, inputWAD);
-		printf("%2d %8d %8d %8s\n", i, lumps[i].adress, lumps[i].size, lumps[i].name);
+		printf("%2d %8d %8d %8s\n", i, lumps[i].address, lumps[i].size, lumps[i].name);
 	}
+	printf("Filesize: %ld %s\n", filestatus.st_size, BYTES_STR);
+	memset(&filestatus, 0, sizeof(filestatus));
 
 	// Copy/modify lumps
 	fseek(inputWAD, 0x0C, SEEK_SET); //Jump back to the actuall lump data
 	for (uint16_t i = 0; i < WAD_LumpsAmount; i++) {
 		// Set new lump address
-		lumps[i].adress = ftell(outputWAD);
-		if (strncmp(lumps[i].name, "TEXTMAP", 7)) {
+		lumps[i].address = OUTPUT_SIZE;
+		if (strncmp(lumps[i].name, TEXTMAP_STR, 7)) {
 			//Lump is not TEXTMAP, copy the lump contents to the Output WAD unmodified
 			if (lumps[i].size > 0) {
 				LUMP_BUFFER = (char*) malloc(lumps[i].size);
 				fread(LUMP_BUFFER, lumps[i].size, 1, inputWAD);
-				fwrite(LUMP_BUFFER, lumps[i].size, 1, outputWAD);
+				memcpy(OUTPUT_BUFFER + OUTPUT_SIZE, LUMP_BUFFER, lumps[i].size);
+				OUTPUT_SIZE += lumps[i].size;
 				free(LUMP_BUFFER);
 			}
 		} else {
 			//---------- Modify TEXTMAP ----------
-			printf("\n* Working on TEXTMAP of %s *\n", lumps[i-1].name);
+			printf("\n* Working on %s of %s *\n", TEXTMAP_STR, lumps[i-1].name);
 
 			//Copy TEXTMAP to memory
 			LUMP_BUFFER = (char*)malloc(lumps[i].size + 1);
@@ -1311,30 +1320,30 @@ int main(int argc, char *argv[]) {
 
 			//Parse the TEXTMAP into data blocks for the program
 			TEXTMAP_Parse(LUMP_BUFFER);
-			printf("Analized the map, namespace is \"%s\"\n", namespaceStr);
+			printf("Analized the map, %s is \"%s\"\n", NAMESPACE_STR, namespaceValue);
 			free(LUMP_BUFFER); //Unload the lump because we no longer need the original data
 
 			//Load the configuration file for the specified game engine so the program knows better what to optimize
 			if (gameEngine == gameEngine_last) goto skip_config_load;
-			if (stat(configFiles[gameEngine], &config.filestatus)) {
-				fprintf(stderr, "Config file %s not found, \n", configFiles[gameEngine]);
+			if (stat(configFiles[gameEngine], &filestatus)) {
+				fprintf(stderr, "%s %s \"%s\" %s\n", WARNING_STR, CONFIGFILE_STR, configFiles[gameEngine], NOTFOUND_STR);
 			} else {
 				if (FLAGS & FLAG_CONFIGLOADED) CONFIG_Free(&config);
 				if (configFiles[ENGINE_UNKNOWN]) puts("! Using custom game configuration !");
 				config.flags = 0;
 
 				//Try to load the file itself
-				config.filesize = config.filestatus.st_size;
+				config.filesize = filestatus.st_size;
 
 				config.buffer = (char*) malloc(config.filesize + 1);
 				if (!config.buffer) {
-					fprintf(stderr, "Failed to allocate memory for the Config File (%u bytes)\n", config.filesize + 1);
+					fprintf(stderr, "%s %s %s the %s (%u %s)\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, CONFIGFILE_STR, config.filesize + 1, BYTES_STR);
 					goto skip_config_load;
 				}
 				
 				configFile = fopen(configFiles[gameEngine], "rb");
 				if (!configFile) {
-					fprintf(stderr, "Failed to open the %s config file\n", configFiles[gameEngine]);
+					fprintf(stderr, "%s %s open the \"%s\" %s\n", ERROR_STR, FAILEDTO_STR, configFiles[gameEngine], CONFIGFILE_STR);
 					free(config.buffer);
 					config.buffer = 0;
 					goto skip_config_load;
@@ -1347,14 +1356,14 @@ int main(int argc, char *argv[]) {
 
 				config.json = json_parse(config.buffer, config.filesize);
 				if (!config.json) {
-					fprintf(stderr, "Failed to parse JSON data from the config file\n");
+					fprintf(stderr, "%s %s parse JSON data from the %s\n", ERROR_STR, FAILEDTO_STR, CONFIGFILE_STR);
 					free(config.buffer);
 					config.buffer = 0;
 					goto skip_config_load;
 				}
 
 				if (!CONFIG_Parse(&config)) {
-					fprintf(stderr, "Failed to parse the config file, program will not do deep level optimization\n");
+					fprintf(stderr, "%s %s parse the %s, program will not do deep level optimization\n", ERROR_STR, FAILEDTO_STR, CONFIGFILE_STR);
 					CONFIG_Free(&config);
 					memset(&config, 0, sizeof(config));
 					goto skip_config_load;
@@ -1383,8 +1392,9 @@ int main(int argc, char *argv[]) {
 			lumps[i].size = strlen(LUMP_BUFFER);
 
 			// Write the new TEXTMAP to the Output WAD
-			fwrite(LUMP_BUFFER, lumps[i].size, 1, outputWAD);
-			printf("* Wrote the modified TEXTMAP data of %s to the output *\n", lumps[i-1].name);
+			memcpy(OUTPUT_BUFFER + OUTPUT_SIZE, LUMP_BUFFER, lumps[i].size);
+			OUTPUT_SIZE += lumps[i].size;
+			printf("* Wrote the modified %s data of %s to the %s *\n", TEXTMAP_STR, lumps[i-1].name, OUTPUT_STR);
 
 			free(LUMP_BUFFER);
 			gameEngine_last = gameEngine;
@@ -1393,25 +1403,37 @@ int main(int argc, char *argv[]) {
 
 	if (FLAGS & FLAG_CONFIGLOADED) CONFIG_Free(&config);
 
-	// Directory Table address
-	bufferA = ftell(outputWAD); //where we are in the output WAD
-	fseek(outputWAD, 8, SEEK_SET); //go back to the Directory Table address pointer in WAD
-	fwrite(&bufferA, 4, 1, outputWAD); //write the address
-	fseek(outputWAD, bufferA, SEEK_SET); //get back to the Directory Table
+
+	//Write the correct Directory Table address
+	memcpy(OUTPUT_BUFFER + 8, &OUTPUT_SIZE, 4);
 
 	//Write the new Directory Table
-	puts("\nDirectory Table of the Output WAD:");
-	puts("\nID   ADRESS     SIZE     NAME");
+	printf("\nDirectory Table of the %s %s:", OUTPUT_STR, WAD_STR);
+	puts(DIRTABLE_STR);
 	for (uint16_t i = 0; i < WAD_LumpsAmount; i++) {
-		printf("%2d %8d %8d %8s\n", i, lumps[i].adress, lumps[i].size, lumps[i].name);
-		fwrite(&lumps[i].adress, 4, 1, outputWAD);
-		fwrite(&lumps[i].size, 4, 1, outputWAD);
-		fwrite(lumps[i].name, 8, 1, outputWAD);
+		printf("%2d %8d %8d %8s\n", i, lumps[i].address, lumps[i].size, lumps[i].name);
+		memcpy(OUTPUT_BUFFER + OUTPUT_SIZE, &lumps[i].address, 4);
+		OUTPUT_SIZE += 4;
+		memcpy(OUTPUT_BUFFER + OUTPUT_SIZE, &lumps[i].size, 4);
+		OUTPUT_SIZE += 4;
+		memcpy(OUTPUT_BUFFER + OUTPUT_SIZE, lumps[i].name, 8);
+		OUTPUT_SIZE += 8;
 	}
+	printf("Filesize: %d %s\n", OUTPUT_SIZE, BYTES_STR);
 
-	closeIO();
+	outputWAD = fopen(outputFilePath, "wb");
+	if (!outputWAD) {
+		fprintf(stderr, "%s %s open %s %s (%s)\n", ERROR_STR, FAILEDTO_STR, OUTPUT_STR, WAD_STR, outputFilePath);
+		fclose(inputWAD); inputWAD = 0;
+		fclose(outputWAD); outputWAD = 0;
+		return 1; }
+
+	fwrite(OUTPUT_BUFFER, OUTPUT_SIZE, 1, outputWAD);
+
+	fclose(inputWAD); inputWAD = 0;
+	fclose(outputWAD); outputWAD = 0;
 	free(lumps);
 
-	printf("\n\"%s\" is ready. Make sure to check the contents of the WAD for corruptions!\n", outputFilePath);
+	printf("\n\"%s\" is ready. Make sure to check the contents of the %s for corruptions!\n", outputFilePath, WAD_STR);
 	return 0;
 }
