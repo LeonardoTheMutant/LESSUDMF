@@ -118,7 +118,7 @@ uint8_t gameEngine_last = UINT8_MAX;
 
 static FILE *inputWAD;
 static FILE *outputWAD;
-static char outputFilePath[PATH_MAX] = "./OUTPUT.WAD";
+static char outputFilePath[UINT8_MAX] = "./OUTPUT.WAD";
 static FILE *configFile;
 config_t config;
 struct stat filestatus;
