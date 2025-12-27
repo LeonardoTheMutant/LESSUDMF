@@ -1,10 +1,9 @@
-//"Less UDMF" version 4.1
+//"Less UDMF" version 4.2
 //A tool to optimize the UDMF maps data in WAD
 //Code by LeonardoTheMutant
 
 //Changes in version 4.1:
-// - Remade I/O to make reading & writing to the same WAD file possible
-// - Did string optimizations to reduce their size in the compiled executable
+// - Added trailing zeros trimming for float values
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -169,6 +168,11 @@ static uint8_t isspace(char c) {
 	return (c == 0x20 || c == 0x09 || (c >= 0x0a && c <= 0x0d));
 }
 
+//isdigit() from ctype.h
+static uint8_t isdigit(char c) {
+	return (c >= '0' && c <= '9');
+}
+
 // Get the value for a key in a block
 static const char *getFieldValueFromBlock(const block_t *blk, const char *key) {
 	for (uint8_t i = 0; i < blk->fieldsCount; i++) {
@@ -182,6 +186,16 @@ static uint8_t BOOL_BlockHasField(const block_t *blk, const char *strkey) {
 	for (uint8_t i = 0; i < blk->fieldsCount; i++) {
 		if (!strcmp(blk->fields[i].key, strkey)) return 1;
 	}
+	return 0;
+}
+
+// Check if string is a valid float number
+static uint8_t BOOL_IsStrFloat(const char *s) {
+	float num;
+	char extra;
+
+	// Attempt to parse the string as a float and detect any extra characters
+	if (sscanf(s, " %f %c", &num, &extra) == 1) return 1;
 	return 0;
 }
 
@@ -228,6 +242,18 @@ static void removeField(block_t *blk, const char *key) {
 			return;
 		}
 	}
+}
+
+// Remove trailing zeros from float values
+static const char *FLOAT_TrimValue(char *str) {
+	char *dot = strchr(str, '.');
+	if (!dot) return str;
+	char *end = str + strlen(str) - 1;
+	while (end > dot && *end == '0') end--;
+	if (end == dot && *end == '.') *end = 0;
+	else *(end+1) = 0;
+
+	return str;
 }
 
 //Compare two block_t structs
@@ -1136,6 +1162,7 @@ static void TEXTMAP_Parse(char *textmapdata) {
 			}
 			value[vi] = '\0';
 
+			if (BOOL_IsStrFloat(value)) FLOAT_TrimValue(value);
 			addField(blk, key, value);
 
 			// advance past semicolon if present
@@ -1191,15 +1218,15 @@ static char* TEXTMAP_Generate(block_t *blocks) {
 
 	//Final newline
 	if (used + 1 > allocated) {
-        allocated += 2;
-        out = (char*) realloc(out, allocated);
+		allocated += 2;
+		out = (char*) realloc(out, allocated);
 		if (!out) {
 			fprintf(stderr, "%s %s re%s the new %s lump (%u %s)\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, TEXTMAP_STR, allocated, BYTES_STR);
 			return 0;
 		}
-    }
-    out[used++] = '\n';
-    out[used] = 0;
+	}
+	out[used++] = '\n';
+	out[used] = 0;
 	return out;
 }
 
