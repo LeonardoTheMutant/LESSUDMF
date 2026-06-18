@@ -1,14 +1,21 @@
-//"Less UDMF" version 4.2
+//"Less UDMF" version 4.3
 //A tool to optimize the UDMF maps data in WAD
 //Code by LeonardoTheMutant
 
-//Changes in version 4.1:
-// - Added trailing zeros trimming for float values
+//Changes in version 4.3:
+// - Added a procedure of removing hidden from walls
+// - Corrected the sloped sector detection
+
+// TODO:
+// - Add the functionality of removig floor & ceiling textures from sectors that have floor height >= ceiling
+// - Remove the texture parameter values if the texture itself is not applied
+// - Make use of the level parts structs (linedef_t, sidedef_t, sector_t) instead of searching the blocks array every time
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h> //for isspace()
 #include <sys/stat.h>
 
 #include "json.h"
@@ -49,13 +56,13 @@ enum {
 
 //Config files
 const char *configFiles[] = {
-	0,					//ENGINE_UNKNOWN, custom config filepath goes there
-	"./DOOM.JSON",		//ENGINE_DOOM
-	"./HERETIC.JSON",	//ENGINE_HERETIC
-	"./HEXEN.JSON",		//ENGINE_HEXEN
-	"./STRIFE.JSON",	//ENGINE_STRIFE
-	"./ZDOOM.JSON",		//ENGINE_ZDOOM
-	"./SRB2.JSON"		//ENGINE_SRB2
+	0,		//ENGINE_UNKNOWN, custom config filepath goes there
+	"DOOM.JSON",	//ENGINE_DOOM
+	"HERETIC.JSON",	//ENGINE_HERETIC
+	"HEXEN.JSON",	//ENGINE_HEXEN
+	"STRIFE.JSON",	//ENGINE_STRIFE
+	"ZDOOM.JSON",	//ENGINE_ZDOOM
+	"SRB2.JSON"	//ENGINE_SRB2
 };
 
 //Level elements
@@ -83,28 +90,41 @@ typedef struct {
 //single TEXTMAP data block
 typedef struct {
 	char header[8]; //"sector", "sidedef", "thing", etc.
-	field_t *fields; //array of key/value fields
 	uint8_t fieldsCount; //amount of fields the block has
+	field_t *fields; //array of key/value fields
 } block_t;
 
 typedef struct {
 	block_t *block; //pointer to the block
-	char isMaster; // 1=kept, 0=removed as duplicate, -1=unvisited
-	char isSlope; // 1=sloped sector, 0=not sloped
 	int sectorID; //index of the sector in ORIGINAL ordering
 	int masterID; // new index of the sector
+	char isMaster; // 1=kept, 0=removed as duplicate, -1=unvisited
+	char isSlope; // 1=sloped sector, 0=not sloped
 } sector_t;
+
+typedef struct { //CURRENTLY UNUSED
+	block_t *block;
+	sector_t *sector;
+} sidedef_t;
+
+typedef struct { //CURRENTLY UNUSED
+	block_t *block;
+	block_t *v1;
+	block_t *v2;
+	sidedef_t *sidefront;
+	sidedef_t *sideback;
+} linedef_t;
 
 typedef struct {
 	uint32_t filesize;
-	char *buffer;
-	json_value *json;
 	uint16_t *linedefSpecialsNoTexture;
 	uint16_t *linedefSpecialsSlope;
-	char **sectorFieldsSlope;
 	uint16_t *thingTypesNoAngle;
-	field_t *defaultValues[5];
+	char *buffer;
+	char **sectorFieldsSlope;
 	uint8_t flags;
+	json_value *json;
+	field_t *defaultValues[5];
 } config_t;
 
 block_t *blocks;
@@ -156,6 +176,14 @@ const char SIDEBACK_STR[] = "sideback";
 const char SPECIAL_STR[] = "special";
 const char ZFLOOR_STR[] = "zfloor";
 const char ZCEILING_STR[] = "zceiling";
+const char TWOSIDED_STR[] = "twosided";
+const char FLOORHEIGHT_STR[] = "heightfloor";
+const char CEILINGHEIGHT_STR[] = "heightceiling";
+const char TEXTURETOP_STR[] = "texturetop";
+const char TEXTUREBOTTOM_STR[] = "texturebottom";
+const char TEXTUREMIDDLE_STR[] = "texturemiddle";
+const char TEXTUREFLOOR_STR[] = "texturefloor";
+const char TEXTURECEILING_STR[] = "textureceiling";
 const char DEFAULTVALUES_STR[] = "defaultValues";
 const char FAILEDTO_STR[] = "Failed to";
 const char NOTFOUND_STR[] = "not found";
@@ -163,18 +191,10 @@ const char ALLOCATEFOR_STR[] = "allocate memory for";
 const char CONFIGFILE_STR[] = "Config File";
 const char BYTES_STR[] = "bytes";
 
-//isspace() from ctype.h
-static uint8_t isspace(char c) {
-	return (c == 0x20 || c == 0x09 || (c >= 0x0a && c <= 0x0d));
-}
-
-//isdigit() from ctype.h
-static uint8_t isdigit(char c) {
-	return (c >= '0' && c <= '9');
-}
-
 // Get the value for a key in a block
 static const char *getFieldValueFromBlock(const block_t *blk, const char *key) {
+	if (!(blk && key)) return 0;
+
 	for (uint8_t i = 0; i < blk->fieldsCount; i++) {
 		if (!strcmp(blk->fields[i].key, key)) return blk->fields[i].value;
 	}
@@ -183,6 +203,8 @@ static const char *getFieldValueFromBlock(const block_t *blk, const char *key) {
 
 // Check if the block contains a field with the given key
 static uint8_t BOOL_BlockHasField(const block_t *blk, const char *strkey) {
+	if (!(blk && strkey)) return 0;
+
 	for (uint8_t i = 0; i < blk->fieldsCount; i++) {
 		if (!strcmp(blk->fields[i].key, strkey)) return 1;
 	}
@@ -191,16 +213,20 @@ static uint8_t BOOL_BlockHasField(const block_t *blk, const char *strkey) {
 
 // Check if string is a valid float number
 static uint8_t BOOL_IsStrFloat(const char *s) {
-	float num;
-	char extra;
-
-	// Attempt to parse the string as a float and detect any extra characters
-	if (sscanf(s, " %f %c", &num, &extra) == 1) return 1;
+	if (s) {
+		float num;
+		char extra;
+		
+		// Attempt to parse the string as a float and detect any extra characters
+		if (sscanf(s, " %f %c", &num, &extra) == 1) return 1;
+	}
 	return 0;
 }
 
 //Add a key/value field into block
 static void addField(block_t *blk, const char *key, const char *value) {
+	if (!(blk && key)) return;
+
 	field_t *tmp = (field_t*) realloc(blk->fields, (blk->fieldsCount + 1) * sizeof(field_t));
 	if (!tmp) {
 		fprintf(stderr, "%s %s re%s the new field in block\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
@@ -209,7 +235,7 @@ static void addField(block_t *blk, const char *key, const char *value) {
 	blk->fields = tmp;
 
 	blk->fields[blk->fieldsCount].key = strdup(key);
-	blk->fields[blk->fieldsCount].value = strdup(value);
+	blk->fields[blk->fieldsCount].value = strdup(value ? value : "0");
 	if (!blk->fields[blk->fieldsCount].key || !blk->fields[blk->fieldsCount].value) {
 		fprintf(stderr, "%s addField: out of memory while copying strings\n", ERROR_STR);
 		exit(1);
@@ -219,6 +245,8 @@ static void addField(block_t *blk, const char *key, const char *value) {
 }
 
 static void removeField(block_t *blk, const char *key) {
+	if (!(blk && key)) return;
+
 	for (uint8_t i = 0; i < blk->fieldsCount; i++) {
 		if (!strcmp(blk->fields[i].key, key)) {
 			free(blk->fields[i].key);
@@ -258,6 +286,8 @@ static const char *FLOAT_TrimValue(char *str) {
 
 //Compare two block_t structs
 static char BOOL_AreBlocksEqual(const block_t *a, const block_t *b) {
+	if (!(a && b)) return 0;
+
 	if (a->fieldsCount != b->fieldsCount) return 0;
 	char *matched = (char*) calloc(a->fieldsCount, 1);
 	if (!matched) return 0;
@@ -568,35 +598,45 @@ static void CONFIG_Free(config_t *config) {
 // The returned array is always of size 2 (sidefront, sideback), with NULL for any missing side.
 // The caller does not own the returned array (static buffer).
 static block_t **LINEDEF_GetSidedefs(block_t *linedef, uint8_t *sidesCount) {
-	block_t **sidedefs;
-	sidedefs = (block_t**) malloc(sizeof(block_t*) * 2);
-	*sidesCount = 0;
 	const char *sidefront_str = getFieldValueFromBlock(linedef, SIDEFRONT_STR);
 	const char *sideback_str  = getFieldValueFromBlock(linedef, SIDEBACK_STR);
 	int32_t sidefront = -1, sideback = -1;
 	if (sidefront_str) sidefront = strtol(sidefront_str, 0, 10);
 	if (sideback_str)  sideback  = strtol(sideback_str,  0, 10);
 
-	// Find the sidedef blocks by index
-	uint8_t found = 0;
+	// Locate the actual sidedef block pointers (or NULL if not found)
+	block_t *ptr_front = NULL;
+	block_t *ptr_back  = NULL;
 	int32_t idx = 0;
 	for (uint32_t i = 0; i < blockCount; i++) {
 		if (!strncmp(blocks[i].header, SIDEDEF_STR, 7)) {
-			if (idx == sidefront && sidefront >= 0) {
-				sidedefs[0] = &blocks[i];
-				found++;
-			}
-			if (idx == sideback && sideback >= 0) {
-				sidedefs[1] = &blocks[i];
-				found++;
-			}
+			if (idx == sidefront && sidefront >= 0) ptr_front = &blocks[i];
+			if (idx == sideback  && sideback  >= 0) ptr_back  = &blocks[i];
 			idx++;
-			if (found == 2) break;
+			if (ptr_front && ptr_back) break;
 		}
 	}
 
-	*sidesCount = (sidefront >= 0 && sideback >= 0 && sidefront != sideback) ? 2 : (sidefront >= 0 ? 1 : 0) + (sideback >= 0 && sideback != sidefront ? 1 : 0);
-	return sidedefs;
+	// Build a compact array of valid pointers to return
+	block_t **sidedefs = NULL;
+	uint8_t count = 0;
+	if (ptr_front) {
+		sidedefs = (block_t**) malloc(sizeof(block_t*) * (count + 1));
+		sidedefs[count++] = ptr_front;
+	}
+	if (ptr_back && ptr_back != ptr_front) {
+		sidedefs = (block_t**) realloc(sidedefs, sizeof(block_t*) * (count + 1));
+		if (!sidedefs) {
+			free(sidedefs);
+			sidedefs = 0;
+			fprintf(stderr, "%s %s re%s the %ss array for a linedef block\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, SIDEDEF_STR);
+			exit(1);
+		}
+		sidedefs[count++] = ptr_back;
+	}
+
+	*sidesCount = count;
+	return sidedefs;    
 }
 
 // Collect linedef blocks that reference any sidedef belonging to the given sector.
@@ -604,8 +644,7 @@ static block_t **LINEDEF_GetSidedefs(block_t *linedef, uint8_t *sidesCount) {
 // returned array (but not the block_t pointers themselves).
 static block_t **SECTOR_GetLinedefs(uint32_t sectorIndex, uint32_t *outCount) {
 	*outCount = 0;
-	if (sectorIndex >= sectorCount) return 0;
-
+ 
 	// First pass: find which sidedef indices point to this sector
 	bufferA = 0; //side index
 	bufferB = 0; //matching count
@@ -619,6 +658,11 @@ static block_t **SECTOR_GetLinedefs(uint32_t sectorIndex, uint32_t *outCount) {
 				uint32_t sval = strtol(sec, 0, 10);
 				if (sval == sectorIndex) {
 					matchingSides = (int32_t*) realloc(matchingSides, (bufferB + 1) * sizeof(int32_t));
+					if (!matchingSides) {
+						free(matchingSides);
+						fprintf(stderr, "%s %s re%s the matching %ss array in SECTOR_GetLinedefs\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, SIDEDEF_STR);
+						exit(1);
+					}
 					matchingSides[bufferB++] = bufferA;
 				}
 			}
@@ -646,6 +690,11 @@ static block_t **SECTOR_GetLinedefs(uint32_t sectorIndex, uint32_t *outCount) {
 						for (uint16_t m = 0; m < bufferB; m++) {
 							if (iv == matchingSides[m]) {
 								found = (block_t**) realloc(found, (bufferA + 1) * sizeof(block_t*));
+								if (!found) {
+									free(found);
+									fprintf(stderr, "%s %s re%s the found %ss array in SECTOR_GetLinedefs\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, LINEDEF_STR);
+									exit(1);
+								}
 								found[bufferA++] = &blocks[i];
 								goto next_linedef; // avoid adding same linedef multiple times
 							}
@@ -667,7 +716,6 @@ static block_t **SECTOR_GetLinedefs(uint32_t sectorIndex, uint32_t *outCount) {
 // Caller must free the returned array (but not the block_t pointers themselves).
 static block_t **SECTOR_GetPolygonVertices(uint32_t sectorIndex, uint32_t *outCount) {
 	*outCount = 0;
-	if (sectorIndex >= sectorCount) return 0;
 
 	// First pass: collect sidedef indices belonging to this sector
 	bufferA = 0; //side Idx
@@ -680,6 +728,11 @@ static block_t **SECTOR_GetPolygonVertices(uint32_t sectorIndex, uint32_t *outCo
 				uint32_t sval = strtol(sec, 0, 10);
 				if (sval == sectorIndex) {
 					sidedefIndices = (int32_t*) realloc(sidedefIndices, (bufferB + 1) * sizeof(int32_t));
+					if (!sidedefIndices) {
+						free(sidedefIndices);
+						fprintf(stderr, "%s %s re%s the %s indices array in SECTOR_GetPolygonVertices\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, SIDEDEF_STR);
+						exit(1);
+					}
 					sidedefIndices[bufferB++] = bufferA;
 				}
 			}
@@ -735,6 +788,11 @@ static block_t **SECTOR_GetPolygonVertices(uint32_t sectorIndex, uint32_t *outCo
 					for (uint32_t f = 0; f < foundCount; f++) if (found[f] == vertexList[idx]) { already = 1; break; }
 					if (!already) {
 						found = (block_t**) realloc(found, (foundCount + 1) * sizeof(block_t*));
+						if (!found) {
+							free(found);
+							fprintf(stderr, "%s %s re%s the found %s array in SECTOR_GetPolygonVertices\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, VERTEX_STR);
+							exit(1);
+						}
 						found[foundCount++] = vertexList[idx];
 					}
 				}
@@ -750,10 +808,21 @@ static block_t **SECTOR_GetPolygonVertices(uint32_t sectorIndex, uint32_t *outCo
 
 // Determine whether a sector is likely a sloped sector by checking for slope-related fields
 // in the sector itself, related linedefs and vertices.
-// Argument is an index to the sectors[] array
 static char BOOL_IsSectorSloped(uint32_t sectorIndex) {
-	if (sectorIndex >= sectorCount) return 0;
-	block_t *sectorBlk = sectors[sectorIndex].block;
+	block_t *sectorBlk = 0;
+	uint32_t sector_id = 0;
+
+	for (uint32_t i = 0; i < blockCount; i++) {
+		if (!strncmp(blocks[i].header, SECTOR_STR, 6)) {
+			if (sector_id == sectorIndex) {
+				sectorBlk = &blocks[i];
+				break;
+			}
+			sector_id++;
+		}
+	}
+
+	if (!sectorBlk) return 0;
 
 	if (config.sectorFieldsSlope) {
 		for (uint16_t x = 0; config.sectorFieldsSlope[x]; x++) {
@@ -774,7 +843,9 @@ static char BOOL_IsSectorSloped(uint32_t sectorIndex) {
 
 			for (uint16_t s = 0; config.linedefSpecialsSlope[s]; s++) {
 				if (bufferB == config.linedefSpecialsSlope[s]) {
-					//Found a slope creating linedef - sector is sloped
+					// We'll ignore the fact that the line may not actually create the slope (it may exist just for fun & giggles)
+					// or that it can create one on the front sector, leaving back sector unaffected (or vise-versa)
+					// This part can be greatly imroved by adding those checks
 					free(linedefs);
 					return 1;
 				}
@@ -784,42 +855,30 @@ static char BOOL_IsSectorSloped(uint32_t sectorIndex) {
 
 	if (gameEngine == ENGINE_SRB2) {
 		// Polygon-only vertex check: collect unique polygon vertices for the sector and inspect them.
-		// Stricter rule: require at least two distinct numeric vertex heights to mark the sector sloped.
+		// Rule: mark as sloped if ANY vertex has a z-value (zfloor or zceiling).
 		bufferA = 0; //polyVertexCount
 		block_t **polyVertices = SECTOR_GetPolygonVertices(sectorIndex, &bufferA);
 
-		if (polyVertices) {
-			double *zvals = 0;
-			uint32_t zcount = 0;
+		if (polyVertices && (bufferA == 3)) { //Polysector needs to have exacly 3 vertices
+			char hasZvalue = 0;
 
-			for (uint32_t pv = 0; pv < bufferA; pv++) {
+			for (uint8_t pv = 0; pv < bufferA; pv++) {
 
-				const char *zstr = 0;
-				if (BOOL_BlockHasField(polyVertices[pv], ZFLOOR_STR)) zstr = getFieldValueFromBlock(polyVertices[pv], ZFLOOR_STR);
-				else if (BOOL_BlockHasField(polyVertices[pv], ZCEILING_STR)) zstr = getFieldValueFromBlock(polyVertices[pv], ZCEILING_STR);
+				const char *z_floor_str = getFieldValueFromBlock(polyVertices[pv], ZFLOOR_STR);
+				const char *z_ceil_str  = getFieldValueFromBlock(polyVertices[pv], ZCEILING_STR);
 
-				if (zstr && *zstr) {
-					double zv = strtod(zstr, 0);
-					char found = 0;
-
-					for (uint32_t zi = 0; zi < zcount; zi++)
-						if (zvals && zvals[zi] == zv) { found = 1; break; }
-
-					if (!found) {
-						zvals = (double*) realloc(zvals, (zcount + 1) * sizeof(double));
-						zvals[zcount++] = zv;
-					}
+				if (z_floor_str || z_ceil_str) {
+					hasZvalue = 1;
+					break;
 				}
 			}
 
-			if (zcount > 0) {
-				free(zvals);
+			if (hasZvalue) {
 				free(polyVertices);
 				free(linedefs);
 				return 1;
 			}
 
-			free(zvals);
 			free(polyVertices);
 		}
 	}
@@ -830,6 +889,7 @@ static char BOOL_IsSectorSloped(uint32_t sectorIndex) {
 
 static void MAP_RemoveControlLineTextures() {
 	printf("Removing textures on control linedefs that do not require them... ");
+
 	block_t *b;
 
 	for (uint32_t x = 0; x < blockCount; x++) {
@@ -857,6 +917,140 @@ static void MAP_RemoveControlLineTextures() {
 		}
 	}
 	puts(DONE_STR);
+}
+
+static void MAP_RemoveUnseenWallTextures() {
+    printf("Removing hidden/not-visible textures from walls... ");
+    block_t *b;
+    uint32_t lineID = 0;
+
+	//
+	// This function perhaps can be optimized
+	//
+
+    for (uint32_t x = 0; x < blockCount; x++) {
+        b = &blocks[x];
+
+        if (!strncmp(b->header, LINEDEF_STR, 7)) {
+            lineID++;
+
+            // Get sidedef IDs
+            const char *sdf_id = getFieldValueFromBlock(b, SIDEFRONT_STR);
+            const char *sdb_id = getFieldValueFromBlock(b, SIDEBACK_STR);
+            uint8_t has_back = (sdb_id ? 1 : 0);
+
+            if (!sdf_id) {
+                printf("%s Linedef %u has no front %s assigned.\n", WARNING_STR, lineID - 1, SIDEDEF_STR);
+                continue;
+            }
+
+            uint32_t side_front_id = strtol(sdf_id, 0, 10);
+            uint32_t side_back_id  = sdb_id ? (uint32_t)strtol(sdb_id, 0, 10) : UINT32_MAX;
+
+			// Find front & back sidedef blocks for the line
+            block_t *sides[2] = { 0, 0 }; // 0 - front, 1 - back
+            uint32_t side_id = 0;
+            for (uint32_t i = 0; ((i < blockCount) && (!sides[0] || (has_back && !sides[1]))); i++) {
+                if (!strncmp(blocks[i].header, SIDEDEF_STR, 7)) {
+                    if (side_id == side_front_id) sides[0] = &blocks[i];
+                    if (has_back && (side_id == side_back_id)) sides[1] = &blocks[i];
+                    side_id++;
+                }
+            }
+            if (!sides[0]) {
+                printf("%s Linedef %u: could not find front %s (index %u)\n", WARNING_STR, lineID - 1, SIDEDEF_STR, side_front_id);
+                continue;
+            }
+            if (has_back && !sides[1]) {
+                printf("%s Linedef %u: could not find back %s (index %u)\n", WARNING_STR, lineID - 1, SIDEDEF_STR, side_back_id);
+                continue;
+            }
+
+            // retrieve sector indices for existing sidedefs
+            uint32_t sector_idx[2] = { UINT32_MAX, UINT32_MAX };
+            for (uint8_t si = 0; si < (1 + has_back); ++si) {
+                if (!sides[si]) continue; //safety check
+
+                const char *sec_id = getFieldValueFromBlock(sides[si], SECTOR_STR);
+                if (!sec_id) {
+                    printf("%s Linedef %u has a %s with no sector assigned.\n", WARNING_STR, lineID - 1, SIDEDEF_STR);
+                    sides[si] = 0; // mark as invalid
+                    continue;
+                }
+                sector_idx[si] = (uint32_t)strtol(sec_id, 0, 10);
+            }
+
+            if (!sides[0]) continue; // front side must be valid
+
+            // find sector blocks
+            block_t *sectors[2] = { 0, 0 };
+            uint32_t sector_id = 0;
+            for (uint32_t i = 0; i < blockCount && (!sectors[0] || (sector_idx[1] < UINT32_MAX && !sectors[1])); i++) {
+                if (!strncmp(blocks[i].header, SECTOR_STR, 6)) {
+                    if (sector_id == sector_idx[0]) sectors[0] = &blocks[i];
+                    if (sector_idx[1] < UINT32_MAX && sector_id == sector_idx[1]) sectors[1] = &blocks[i];
+                    sector_id++;
+                }
+            }
+            if (!sectors[0]) {
+                printf("%s Linedef %u: could not find the front %s (index %u)\n", WARNING_STR, lineID - 1, SECTOR_STR, sector_idx[0]);
+                continue;
+            }
+            if (sector_idx[1] < UINT32_MAX && !sectors[1]) {
+                printf("%s Linedef %u: could not find the back %s (index %u)\n", WARNING_STR, lineID - 1, SECTOR_STR, sector_idx[1]);
+                continue;
+            }
+
+            // if any sector is sloped or is a slope, skip the line
+			// those 2 function calls are probably the reason for slowdown
+            if (BOOL_IsSectorSloped(sector_idx[0]) || (sector_idx[1] < UINT32_MAX && BOOL_IsSectorSloped(sector_idx[1])))
+                continue;
+
+            // read sector heights
+            const char *floor_front = getFieldValueFromBlock(sectors[0], FLOORHEIGHT_STR);
+            const char *ceil_front  = getFieldValueFromBlock(sectors[0], CEILINGHEIGHT_STR);
+            const char *floor_back = (sectors[1] ? getFieldValueFromBlock(sectors[1], FLOORHEIGHT_STR) : 0);
+            const char *ceil_back  = (sectors[1] ? getFieldValueFromBlock(sectors[1], CEILINGHEIGHT_STR) : 0);
+
+            if (!(floor_front && ceil_front)) continue;
+            int32_t ff = (int32_t)strtol(floor_front, 0, 10); //floor front
+            int32_t cf = (int32_t)strtol(ceil_front,  0, 10); //ceiling front
+
+            if (sectors[1]) {
+				// twosided: only proceed if we have both floor/ceil strings for the back sector
+                if (!(floor_back && ceil_back)) continue;
+                int32_t fb = (int32_t)strtol(floor_back, 0, 10); //floor back
+                int32_t cb = (int32_t)strtol(ceil_back,  0, 10); //ceiling back
+
+                int32_t floorv[2] = { ff, fb };
+                int32_t ceilv [2] = { cf, cb };
+
+				// I would not come up with this for-loop without AI, like at all
+				// I wrote ~9 if statements to check each possible combination
+                for (uint8_t i = 0; i < 2; ++i) {
+                    uint8_t o = 1 - i; //the other side
+                    // remove upper on side not visible
+                    if (ceilv[i] <= ceilv[o]) removeField(sides[i], TEXTURETOP_STR);
+                    // remove lower on side not visible
+                    if (floorv[i] >= floorv[o]) removeField(sides[i], TEXTUREBOTTOM_STR);
+                    // remove middle if floor >= own ceiling or floor >= other ceiling
+                    if ((floorv[i] >= ceilv[i]) || (floorv[i] >= ceilv[o])) removeField(sides[i], TEXTUREMIDDLE_STR);
+                }
+            } else {
+				// onesided: if floor height >= ceiling height, remove all sidedef fields
+                if (ff >= cf) {
+					// In my perfect scenario, if all textures are getting removed, all texture parameters should be removed as well.
+					// Doing exactly that.
+					for (uint8_t key_index = 0; key_index < sides[0]->fieldsCount; key_index++) {
+						if (!strcmp(sides[0]->fields[key_index].key, SECTOR_STR)) continue; //do not remove the sector field
+						removeField(sides[0], sides[0]->fields[key_index].key);
+					}
+                }
+            }
+        }
+    }
+
+    puts(DONE_STR);
 }
 
 static void MAP_MergeSectors() {
@@ -1119,6 +1313,11 @@ static void TEXTMAP_Parse(char *textmapdata) {
 
 		//Allocate space for the new block_t and add new block to the memory
 		blocks = (block_t*)realloc(blocks, (blockCount + 1) * sizeof(block_t));
+		if (!blocks) {
+			free(blocks);
+			fprintf(stderr, "%s %s re%s the blocks array for the new block\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR);
+			exit(1);
+		}
 		block_t *blk = &blocks[blockCount];
 		memset(blk, 0, sizeof(block_t));
 		strncpy(blk->header, headerBuf, sizeof(blk->header)-1);
@@ -1203,6 +1402,7 @@ static char* TEXTMAP_Generate(block_t *blocks) {
 			allocated *= 2;
 			out = (char*) realloc(out, allocated);
 			if (!out) {
+				free(out);
 				fprintf(stderr, "%s %s re%s the new %s lump (%u %s)\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, TEXTMAP_STR, allocated, BYTES_STR);
 				return 0;
 			}
@@ -1221,6 +1421,7 @@ static char* TEXTMAP_Generate(block_t *blocks) {
 		allocated += 2;
 		out = (char*) realloc(out, allocated);
 		if (!out) {
+			free(out);
 			fprintf(stderr, "%s %s re%s the new %s lump (%u %s)\n", ERROR_STR, FAILEDTO_STR, ALLOCATEFOR_STR, TEXTMAP_STR, allocated, BYTES_STR);
 			return 0;
 		}
@@ -1242,7 +1443,7 @@ int main(int argc, char *argv[]) {
 		printf("Optimize the %s maps data in %s\n", UDMF_STR, WAD_STR);
 		printf("    -o <%s.%s>\t%s to the file. If not given, the %s will be written to %s\n", OUTPUT_STR, WAD_STR, OUTPUT_STR, OUTPUT_STR, outputFilePath);
 		puts("    -c <config.json>\tLoad custom game engine configuration");
-		puts("    -t\t\tPreserve textures on control linedefs with line specials that do not use them");
+		puts("    -t\t\tPreserve textures on walls that do not require them");
 		puts("    -s\t\tPreserve information about identical sectors, do not merge them with each other");
 		puts("    -a\t\tPreserve angle facing information for things that are no-angle");
 		printf("    -f\t\tPreserve the %s fields which are set to default values\n", UDMF_STR);
@@ -1347,7 +1548,7 @@ int main(int argc, char *argv[]) {
 
 			//Parse the TEXTMAP into data blocks for the program
 			TEXTMAP_Parse(LUMP_BUFFER);
-			printf("Analized the map, %s is \"%s\"\n", NAMESPACE_STR, namespaceValue);
+			printf("Loaded the map data, %s is \"%s\"\n", NAMESPACE_STR, namespaceValue);
 			free(LUMP_BUFFER); //Unload the lump because we no longer need the original data
 
 			//Load the configuration file for the specified game engine so the program knows better what to optimize
@@ -1403,7 +1604,10 @@ int main(int argc, char *argv[]) {
 
 			if (FLAGS & FLAG_CONFIGLOADED) {
 				//Remove unrequired textures from control linedefs (can be disabled with "-t" CLI option)
-				if (!(FLAGS & FLAG_PRESERVETEXTURES)) MAP_RemoveControlLineTextures();
+				if (!(FLAGS & FLAG_PRESERVETEXTURES)) {
+					MAP_RemoveControlLineTextures();
+					MAP_RemoveUnseenWallTextures();
+				}
 
 				// Merge identical sectors (can be disabled with "-s" CLI option)
 				if (!(FLAGS & FLAG_PRESERVESECTORS)) MAP_MergeSectors();
@@ -1452,7 +1656,7 @@ int main(int argc, char *argv[]) {
 	if (!outputWAD) {
 		fprintf(stderr, "%s %s open %s %s (%s)\n", ERROR_STR, FAILEDTO_STR, OUTPUT_STR, WAD_STR, outputFilePath);
 		fclose(inputWAD); inputWAD = 0;
-		fclose(outputWAD); outputWAD = 0;
+		fclose(outputWAD);
 		return 1; }
 
 	fwrite(OUTPUT_BUFFER, OUTPUT_SIZE, 1, outputWAD);
