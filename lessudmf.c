@@ -1214,6 +1214,11 @@ static void MAP_RemoveUnseenFlatTextures() {
     block_t *sector;
     for (uint32_t s = 0; s < sectorCount; s++) {
         sector = sectors[s].block;
+
+        // Ignore sloped sectors
+        if (BOOL_IsSectorSloped(&sectors[s]))
+            continue;
+
         const char *fflat = getFieldValueFromBlock(sector, TEXTUREFLOOR_STR);
         const char *cflat = getFieldValueFromBlock(sector, TEXTURECEILING_STR);
 
